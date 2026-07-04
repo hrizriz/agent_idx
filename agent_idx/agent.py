@@ -9,6 +9,7 @@ from typing import Any
 
 from openai import OpenAI
 
+from agent_idx.chat_log import ChatLog
 from agent_idx.config import Settings
 from agent_idx.data import StockDataStore
 from agent_idx.knowledge import KnowledgeBase
@@ -24,7 +25,8 @@ _TOOL_HINT = re.compile(
     r"periode|tahun|ytd|bbca|bmri|bbri|bbni|goto|idx|saham|"
     r"buat\s+pdf|kirim\s+pdf|generate\s+pdf|"
     r"fundamental|valuasi|rasio|charting|teknikal|nim|npl|roe|roa|der|pe\b|pb\b|"
-    r"belajar|kurikulum|knowledge|digest"
+    r"belajar|kurikulum|knowledge|digest|ajarin|ingat\s+bahwa|catat|"
+    r"chat|group|grup|siapa\s+bilang|diskusi"
     r")\b|"
     r"\b20\d{2}\b|"
     r"\b[A-Z]{3,5}\b",
@@ -40,12 +42,19 @@ KEMAMPUAN TOOLS
   rank_foreign_flow, run_sql (SELECT only)
 - Knowledge belajar: search_knowledge, list_knowledge_topics
   (fundamental, rasio, charting, foreign flow, playbook, daily digest, news digest, weekly lesson)
+- Chat group Telegram yang di-collect (bisa banyak group): list_collected_chats,
+  search_chat_history, recent_chat_history, chat_log_stats
+  (pesan sejak bot aktif di group itu; bukan history sebelum bot masuk.
+   Interaksi user hanya di group utama; group lain di-collect diam-diam.)
 - Berita live: search_news
 - File: create_pdf_report, export_query_csv (terkirim otomatis ke Telegram)
 - Blok "--- ISI PDF ... ---" = dokumen user. Jawab HANYA dari situ kecuali diminta bandingkan data.
 
 PEMBELAJARAN
 - Untuk pertanyaan teori/fundamental/charting/cara analisis: WAJIB search_knowledge dulu.
+- Jika user menyuruh belajar/update knowledge/digest: panggil run_learning_job
+  (market | news | weekly | all).
+- Jika user mengajari ("ingat bahwa", "catat", "ajarin"): panggil save_learning_note.
 - Gabungkan: kerangka fundamental (knowledge) + angka pasar (tools data) + berita bila relevan.
 - Data transaksi BUKAN laporan keuangan. Jangan mengarang NIM/ROE/NPL/laba tanpa sumber PDF/knowledge/berita.
 
@@ -86,10 +95,14 @@ class AnalystAgent:
         settings: Settings,
         store: StockDataStore,
         knowledge: KnowledgeBase | None = None,
+        chat_log: ChatLog | None = None,
+        chat_id: int | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
         self.knowledge = knowledge or KnowledgeBase(settings.knowledge_dir)
+        self.chat_log = chat_log
+        self.chat_id = chat_id if chat_id is not None else settings.telegram_chat_id
         self.client = OpenAI(
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
@@ -99,11 +112,17 @@ class AnalystAgent:
         self.export_dir.mkdir(parents=True, exist_ok=True)
 
     def _system_prompt(self) -> str:
+        chat_stats = ""
+        if self.chat_log is not None:
+            chat_stats = f"\nCHAT LOG: {self.chat_log.stats()}"
+            if self.chat_id is not None:
+                chat_stats += f"\nINTERACTION CHAT_ID: {self.chat_id}"
         return (
             f"{SYSTEM_PROMPT}\n\n"
             f"CAKUPAN DATA TERSEDIA:\n{self._coverage}\n"
             f"FOLDER EXPORT: {self.export_dir}\n"
             f"KNOWLEDGE DIR: {self.knowledge.root}"
+            f"{chat_stats}"
         )
 
     def ask(
@@ -186,6 +205,8 @@ class AnalystAgent:
                         args,
                         export_dir=self.export_dir,
                         knowledge=self.knowledge,
+                        chat_log=self.chat_log,
+                        chat_id=self.chat_id,
                     )
                     files.extend(extract_files(result))
 

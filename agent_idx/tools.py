@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from agent_idx.chat_log import ChatLog
 from agent_idx.data import TOOL_DEFINITIONS as DATA_TOOLS
 from agent_idx.data import StockDataStore, dispatch_tool as dispatch_data_tool
 from agent_idx.knowledge import KnowledgeBase
@@ -39,6 +40,71 @@ EXTRA_TOOLS: list[dict[str, Any]] = [
             "name": "list_knowledge_topics",
             "description": "List file knowledge base (curriculum, daily, news, lessons).",
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_collected_chats",
+            "description": (
+                "List semua group Telegram yang sudah di-collect (chat_id, judul, jumlah pesan). "
+                "Pakai dulu jika user menyinggung group tertentu."
+            ),
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_chat_history",
+            "description": (
+                "Cari pesan yang sudah dikumpulkan dari group Telegram (bisa semua group "
+                "atau satu chat_id). Pakai untuk 'siapa bilang', 'ringkas chat group X'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "chat_id": {
+                        "type": "integer",
+                        "description": "Opsional. Kosongkan = cari di semua group.",
+                    },
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recent_chat_history",
+            "description": (
+                "Ambil N pesan terbaru. chat_id opsional; kosongkan = semua group."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "integer"},
+                    "limit": {"type": "integer", "description": "Default 30, max 100"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "chat_log_stats",
+            "description": "Statistik chat terkumpul (semua group, atau satu chat_id).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {"type": "integer"},
+                },
+                "additionalProperties": False,
+            },
         },
     },
     {
@@ -116,6 +182,47 @@ EXTRA_TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_learning_job",
+            "description": (
+                "Jalankan job belajar sekarang: market digest, news digest, weekly lesson, "
+                "atau all. Pakai jika user bilang 'belajar sekarang', 'update knowledge', "
+                "'generate digest'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job": {
+                        "type": "string",
+                        "enum": ["all", "market", "news", "weekly"],
+                    }
+                },
+                "required": ["job"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_learning_note",
+            "description": (
+                "Simpan catatan ajar dari user ke knowledge/notes agar bisa dicari lagi. "
+                "Pakai jika user bilang 'ingat bahwa', 'catat', 'ajarin agent'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["title", "body"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = DATA_TOOLS + EXTRA_TOOLS
@@ -128,6 +235,8 @@ def dispatch_tool(
     *,
     export_dir: Path,
     knowledge: KnowledgeBase | None = None,
+    chat_log: ChatLog | None = None,
+    chat_id: int | None = None,
 ) -> str:
     try:
         if name == "search_knowledge":
@@ -141,6 +250,35 @@ def dispatch_tool(
             if knowledge is None:
                 return "ERROR: knowledge base not configured"
             return knowledge.list_topics()
+        if name == "list_collected_chats":
+            if chat_log is None:
+                return "ERROR: chat log not configured"
+            return chat_log.list_chats()
+        if name == "search_chat_history":
+            if chat_log is None:
+                return "ERROR: chat log not configured"
+            target = arguments.get("chat_id")
+            if target is not None:
+                target = int(target)
+            return chat_log.search(
+                query=arguments["query"],
+                chat_id=target,
+                limit=int(arguments.get("limit", 20)),
+            )
+        if name == "recent_chat_history":
+            if chat_log is None:
+                return "ERROR: chat log not configured"
+            target = arguments.get("chat_id")
+            if target is not None:
+                target = int(target)
+            return chat_log.recent(chat_id=target, limit=int(arguments.get("limit", 30)))
+        if name == "chat_log_stats":
+            if chat_log is None:
+                return "ERROR: chat log not configured"
+            target = arguments.get("chat_id")
+            if target is not None:
+                target = int(target)
+            return chat_log.stats(target)
         if name == "search_news":
             return search_news(
                 query=arguments["query"],
@@ -160,6 +298,36 @@ def dispatch_tool(
                 store=store,
                 sql=arguments["sql"],
                 filename_prefix=arguments.get("filename_prefix", "query_idx"),
+            )
+        if name == "run_learning_job":
+            if knowledge is None:
+                return "ERROR: knowledge base not configured"
+            from agent_idx.jobs import (
+                job_daily_market_digest,
+                job_daily_news,
+                job_weekly_lesson,
+                run_all_learning_jobs,
+            )
+
+            job = (arguments.get("job") or "all").strip().lower()
+            if job == "market":
+                paths = [job_daily_market_digest(store, knowledge)]
+            elif job == "news":
+                paths = [job_daily_news(knowledge)]
+            elif job == "weekly":
+                paths = [job_weekly_lesson(knowledge)]
+            else:
+                paths = run_all_learning_jobs(store, knowledge)
+            lines = [f"OK: learning job={job}"]
+            for path in paths:
+                lines.append(f"FILE: {path}")
+            return "\n".join(lines)
+        if name == "save_learning_note":
+            if knowledge is None:
+                return "ERROR: knowledge base not configured"
+            return knowledge.save_note(
+                title=arguments["title"],
+                body=arguments["body"],
             )
         return dispatch_data_tool(store, name, arguments)
     except Exception as exc:  # noqa: BLE001

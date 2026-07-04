@@ -14,6 +14,7 @@ class Settings:
     parquet_dir: Path
     export_dir: Path
     knowledge_dir: Path
+    chat_db_path: Path
     llm_base_url: str
     llm_api_key: str
     llm_model: str
@@ -38,6 +39,9 @@ def load_settings() -> Settings:
     )
     export_dir = Path(os.getenv("EXPORT_DIR", str(root / "exports")))
     knowledge_dir = Path(os.getenv("KNOWLEDGE_DIR", str(root / "knowledge")))
+    chat_db_path = Path(
+        os.getenv("CHAT_DB_PATH", str(root / "data" / "telegram_chat.db"))
+    )
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_raw = (
         os.getenv("TELEGRAM_CHAT_ID")
@@ -55,6 +59,7 @@ def load_settings() -> Settings:
         parquet_dir=parquet_dir,
         export_dir=export_dir,
         knowledge_dir=knowledge_dir,
+        chat_db_path=chat_db_path,
         llm_base_url=os.getenv("LLM_BASE_URL", "http://localhost:18765/v1").rstrip("/"),
         llm_api_key=os.getenv("LLM_API_KEY", "sk-local"),
         llm_model=os.getenv("LLM_MODEL", "gemini-3.5-flash-thinking"),

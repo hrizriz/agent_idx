@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from telegram import Document, Message, MessageEntity, Update
-from telegram.constants import ChatAction, ParseMode
+from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -20,6 +20,7 @@ from telegram.ext import (
 )
 
 from agent_idx.agent import AgentResult, AnalystAgent
+from agent_idx.chat_log import ChatLog
 from agent_idx.config import Settings
 from agent_idx.data import StockDataStore
 from agent_idx.format import to_telegram_html
@@ -40,14 +41,19 @@ _DOC_REF = re.compile(
 
 
 def _is_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Only the interaction group (CHAT_ID) may trigger bot replies."""
     allowed: int | None = context.application.bot_data.get("allowed_chat_id")
     if allowed is None:
         return True
     chat = update.effective_chat
     if chat is None or chat.id != allowed:
-        logger.warning("Ignored update from chat_id=%s", getattr(chat, "id", None))
         return False
     return True
+
+
+def _should_collect(chat) -> bool:
+    """Collect from any group/supergroup the bot is in."""
+    return chat is not None and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}
 
 
 def _chunk(text: str, size: int = _MAX_TELEGRAM_CHARS) -> list[str]:
@@ -61,23 +67,36 @@ def _chunk(text: str, size: int = _MAX_TELEGRAM_CHARS) -> list[str]:
 
 
 async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Debug + cache any PDF seen in the allowed chat."""
+    """Collect chat from every group; only interaction group gets replies."""
     msg = update.effective_message
     chat = update.effective_chat
     if not msg or not chat:
         return
 
-    _cache_pdfs_from_message(chat.id, msg)
+    if _should_collect(chat):
+        _cache_pdfs_from_message(chat.id, msg)
+        chat_log: ChatLog | None = context.application.bot_data.get("chat_log")
+        if chat_log is not None:
+            try:
+                # Always register the group (even service/join events with empty text).
+                chat_log.touch_chat(chat.id, chat.title)
+                if not (msg.from_user and msg.from_user.is_bot):
+                    chat_log.add_from_telegram_message(
+                        msg, chat.id, chat_title=chat.title
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to persist chat message")
 
     preview = (msg.text or msg.caption or "").replace("\n", " ")[:120]
     doc = msg.document
     reply_doc = msg.reply_to_message.document if msg.reply_to_message else None
     logger.info(
-        "Update chat_id=%s msg_id=%s doc=%r reply_doc=%r text=%r",
+        "Update chat_id=%s title=%r collect=%s msg_id=%s doc=%r text=%r",
         chat.id,
+        chat.title,
+        _should_collect(chat),
         msg.message_id,
         getattr(doc, "file_name", None),
-        getattr(reply_doc, "file_name", None),
         preview,
     )
 
@@ -119,8 +138,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• kirim/reply PDF + tanya isinya\n\n"
         "Jika mention tidak direspons: @BotFather → /setprivacy → <b>Disable</b>, "
         "lalu kick & add bot lagi ke group.\n\n"
-        "<b>Belajar IDX (cron):</b> curriculum fundamental/charting + digest harian otomatis.\n"
-        "Perintah: /ask /learn /range /reset /help",
+        "<b>Mode group:</b>\n"
+        "• Group interaksi (CHAT_ID): tanya jawab di sini\n"
+        "• Group lain: bot hanya <b>mengumpulkan</b> chat (diam), "
+        "lalu bisa kamu tanya dari group interaksi\n\n"
+        "Agar collect penuh di group pantau: @BotFather /setprivacy → <b>Disable</b>, "
+        "lalu kick+add bot di group itu.\n\n"
+        "Perintah: /ask /learn /chats /range /reset /help",
         parse_mode=ParseMode.HTML,
     )
 
@@ -152,8 +176,48 @@ async def learn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert update.effective_message is not None
     knowledge: KnowledgeBase = context.application.bot_data["knowledge"]
     settings: Settings = context.application.bot_data["settings"]
+    store: StockDataStore = context.application.bot_data["store"]
+    args = [a.lower() for a in (context.args or [])]
+    job = args[0] if args else "status"
+
+    if job in {"all", "market", "news", "weekly", "run"}:
+        status = await update.effective_message.reply_text(
+            f"Menjalankan learning job: {job}..."
+        )
+        from agent_idx.jobs import (
+            job_daily_market_digest,
+            job_daily_news,
+            job_weekly_lesson,
+            run_all_learning_jobs,
+        )
+
+        which = "all" if job == "run" else job
+
+        def _run():
+            if which == "market":
+                return [job_daily_market_digest(store, knowledge)]
+            if which == "news":
+                return [job_daily_news(knowledge)]
+            if which == "weekly":
+                return [job_weekly_lesson(knowledge)]
+            return run_all_learning_jobs(store, knowledge)
+
+        try:
+            paths = await asyncio.to_thread(_run)
+        except Exception as exc:  # noqa: BLE001
+            await status.edit_text(f"Gagal learning job: {exc}")
+            return
+        lines = [f"Selesai: {which}"]
+        for path in paths:
+            lines.append(f"- {path.name}")
+        await status.edit_text("\n".join(lines))
+        return
+
     topics = knowledge.list_topics()
     cron = (
+        "Perintah:\n"
+        "/learn — status materi\n"
+        "/learn all | market | news | weekly — jalankan belajar sekarang\n\n"
         f"cron_enabled={settings.cron_enabled}\n"
         f"market: {settings.cron_market} ({settings.cron_timezone})\n"
         f"news:   {settings.cron_news}\n"
@@ -162,6 +226,21 @@ async def learn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = cron + topics
     for part in _chunk(text):
         await update.effective_message.reply_text(part)
+
+
+async def chats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_allowed(update, context):
+        return
+    assert update.effective_message is not None
+    chat_log: ChatLog = context.application.bot_data["chat_log"]
+    settings: Settings = context.application.bot_data["settings"]
+    text = (
+        f"interaction_chat_id={settings.telegram_chat_id}\n"
+        f"{chat_log.stats()}\n\n"
+        f"{chat_log.list_chats()}\n\n"
+        f"{chat_log.recent(limit=8)}"
+    )
+    await update.effective_message.reply_text(text[:4000])
 
 
 async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -513,7 +592,14 @@ def build_application(settings: Settings, store: StockDataStore) -> Application:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is empty. Set it in .env")
 
     knowledge = KnowledgeBase(settings.knowledge_dir)
-    agent = AnalystAgent(settings, store, knowledge=knowledge)
+    chat_log = ChatLog(settings.chat_db_path)
+    agent = AnalystAgent(
+        settings,
+        store,
+        knowledge=knowledge,
+        chat_log=chat_log,
+        chat_id=settings.telegram_chat_id,
+    )
     app = (
         Application.builder()
         .token(settings.telegram_bot_token)
@@ -525,17 +611,19 @@ def build_application(settings: Settings, store: StockDataStore) -> Application:
     app.bot_data["agent"] = agent
     app.bot_data["store"] = store
     app.bot_data["knowledge"] = knowledge
+    app.bot_data["chat_log"] = chat_log
     app.bot_data["settings"] = settings
     app.bot_data["allowed_chat_id"] = settings.telegram_chat_id
     app.bot_data["export_dir"] = settings.export_dir
 
-    # Log every update first (group -1 runs before other handlers).
+    # Collect + log every update first (group -1 runs before other handlers).
     app.add_handler(TypeHandler(Update, log_update), group=-1)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("ask", ask_cmd))
     app.add_handler(CommandHandler("learn", learn_cmd))
+    app.add_handler(CommandHandler("chats", chats_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("range", range_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

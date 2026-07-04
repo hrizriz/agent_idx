@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 @dataclass
@@ -18,18 +20,34 @@ class KnowledgeBase:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        for sub in ("curriculum", "daily", "news", "lessons"):
+        for sub in ("curriculum", "daily", "news", "lessons", "notes"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
 
     def list_topics(self) -> str:
         lines = [f"knowledge_root={self.root}"]
-        for sub in ("curriculum", "daily", "news", "lessons"):
+        for sub in ("curriculum", "daily", "news", "lessons", "notes"):
             folder = self.root / sub
             files = sorted(folder.glob("*.md"))
             lines.append(f"\n## {sub} ({len(files)} files)")
             for f in files[-20:]:
                 lines.append(f"- {f.name}")
         return "\n".join(lines)
+
+    def save_note(self, title: str, body: str) -> str:
+        title = (title or "catatan").strip()
+        body = (body or "").strip()
+        if not body:
+            raise ValueError("body catatan tidak boleh kosong")
+        stamp = datetime.now(ZoneInfo("Asia/Jakarta")).strftime("%Y%m%d_%H%M%S")
+        slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", title).strip("_")[:40] or "note"
+        path = self.root / "notes" / f"{stamp}_{slug}.md"
+        path.write_text(
+            f"# {title}\n\n"
+            f"Saved: {datetime.now(ZoneInfo('Asia/Jakarta')).isoformat()}\n\n"
+            f"{body}\n",
+            encoding="utf-8",
+        )
+        return f"OK: catatan disimpan\nFILE: {path}"
 
     def search(self, query: str, limit: int = 5) -> str:
         q = (query or "").strip()
