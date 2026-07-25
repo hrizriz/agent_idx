@@ -19,8 +19,9 @@ from telegram.ext import (
     filters,
 )
 
-from agent_idx.agent import AgentResult, AnalystAgent
+from agent_idx.agent import AnalystAgent
 from agent_idx.chat_log import ChatLog
+from agent_idx.stockbit_store import StockbitReportsStore
 from agent_idx.config import Settings
 from agent_idx.data import StockDataStore
 from agent_idx.format import to_telegram_html
@@ -34,9 +35,19 @@ _HISTORY: dict[int, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=20
 _RECENT_PDFS: dict[int, deque[Document]] = defaultdict(lambda: deque(maxlen=10))
 _MAX_TELEGRAM_CHARS = 4000
 _DOC_REF = re.compile(
-    r"\b(pdf|dokumen|document|report|laporan|file|data\s+ini|ini\s+gak|baca\s+ini|"
+    r"\b(pdf|dokumen|document|file|data\s+ini|ini\s+gak|baca\s+ini|"
     r"lampiran|attachment)\b",
     re.I,
+)
+
+# Interactive Stockbit login: chat_id -> {step, username?, resume?}
+# step: "username" | "password" | "otp"
+_PENDING_STOCKBIT: dict[int, dict[str, Any]] = {}
+# Agent request waiting for Stockbit login before resume.
+_STOCKBIT_RESUME: dict[int, str] = {}
+_STOCKBIT_DEFAULT_RESUME = (
+    "Pakai tool stockbit_read untuk membaca halaman Stockbit yang sudah login, "
+    "lalu ringkas isinya. Jangan pakai tools data pasar parquet."
 )
 
 
@@ -76,20 +87,30 @@ async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if _should_collect(chat):
         _cache_pdfs_from_message(chat.id, msg)
         chat_log: ChatLog | None = context.application.bot_data.get("chat_log")
+        pending = _PENDING_STOCKBIT.get(chat.id)
+        # Never store username/password/OTP replies from interactive login.
+        skip_body = pending is not None and pending.get("step") in {
+            "username",
+            "password",
+            "otp",
+        }
         if chat_log is not None:
             try:
                 # Always register the group (even service/join events with empty text).
                 chat_log.touch_chat(chat.id, chat.title)
-                if not (msg.from_user and msg.from_user.is_bot):
+                if not skip_body and not (msg.from_user and msg.from_user.is_bot):
                     chat_log.add_from_telegram_message(
                         msg, chat.id, chat_title=chat.title
                     )
             except Exception:  # noqa: BLE001
                 logger.exception("Failed to persist chat message")
 
-    preview = (msg.text or msg.caption or "").replace("\n", " ")[:120]
+    pending = _PENDING_STOCKBIT.get(chat.id)
+    if pending and pending.get("step") in {"username", "password", "otp"}:
+        preview = f"[redacted stockbit {pending.get('step')}]"
+    else:
+        preview = (msg.text or msg.caption or "").replace("\n", " ")[:120]
     doc = msg.document
-    reply_doc = msg.reply_to_message.document if msg.reply_to_message else None
     logger.info(
         "Update chat_id=%s title=%r collect=%s msg_id=%s doc=%r text=%r",
         chat.id,
@@ -144,7 +165,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "lalu bisa kamu tanya dari group interaksi\n\n"
         "Agar collect penuh di group pantau: @BotFather /setprivacy → <b>Disable</b>, "
         "lalu kick+add bot di group itu.\n\n"
-        "Perintah: /ask /learn /chats /range /reset /help",
+        "<b>Stockbit:</b> browser guest-like (ephemeral).\n"
+        "• /stockbit — login interaktif\n"
+        "• /stockbit status — cek sudah login atau belum\n"
+        "• /stockbit close — tutup sesi\n\n"
+        "Perintah: /ask /stockbit /learn /chats /range /reset /help",
         parse_mode=ParseMode.HTML,
     )
 
@@ -160,6 +185,19 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert update.effective_message is not None
     _HISTORY.pop(update.effective_chat.id, None)
     await update.effective_message.reply_text("Riwayat percakapan direset.")
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_allowed(update, context):
+        return
+    assert update.effective_chat is not None
+    assert update.effective_message is not None
+    chat_id = update.effective_chat.id
+    if chat_id in _PENDING_STOCKBIT:
+        _PENDING_STOCKBIT.pop(chat_id, None)
+        await update.effective_message.reply_text("Login Stockbit dibatalkan.")
+        return
+    await update.effective_message.reply_text("Tidak ada proses login yang aktif.")
 
 
 async def range_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -256,7 +294,94 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _handle_user_message(update, context, question)
 
 
+async def _stockbit_status_text(chat_id: int) -> str:
+    import os
+
+    from agent_idx import browser_stockbit as _sb
+    from agent_idx.browser_stockbit import get_browser
+
+    lines: list[str] = []
+    pending = _PENDING_STOCKBIT.get(chat_id)
+    if pending:
+        lines.append(f"pending_login=True step={pending.get('step')}")
+    resume = _STOCKBIT_RESUME.get(chat_id)
+    if resume:
+        preview = resume.replace("\n", " ")[:100]
+        lines.append(f"waiting_resume={preview!r}")
+
+    if _sb._BROWSER is None:
+        lines.extend(
+            [
+                "browser_ready=False",
+                "login=not_started",
+                "mode=ephemeral/guest-like",
+                "hint: /stockbit untuk login interaktif",
+            ]
+        )
+    else:
+        headless = os.getenv("STOCKBIT_HEADLESS", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        from agent_idx.browser_stockbit import get_browser, run_sync
+
+        lines.append(
+            await asyncio.to_thread(
+                run_sync, lambda: get_browser(headless=headless).status()
+            )
+        )
+    return "\n".join(lines)
+
+
+async def stockbit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stockbit helpers: status | login (default)."""
+    if not _is_allowed(update, context):
+        return
+    assert update.effective_chat is not None
+    assert update.effective_message is not None
+    chat_id = update.effective_chat.id
+    args = context.args or []
+    sub = args[0].lower() if args else "login"
+
+    if sub in {"status", "cek", "check"}:
+        text = await _stockbit_status_text(chat_id)
+        await update.effective_message.reply_text(text)
+        return
+
+    if sub in {"close", "logout"}:
+        from agent_idx.browser_stockbit import shutdown_browser
+
+        _PENDING_STOCKBIT.pop(chat_id, None)
+        await asyncio.to_thread(shutdown_browser)
+        await update.effective_message.reply_text(
+            "Browser Stockbit ditutup. Sesi login dihapus."
+        )
+        return
+
+    if sub not in {"login", ""} and sub not in {"status", "cek", "check", "close", "logout"}:
+        await update.effective_message.reply_text(
+            "Subcommand tidak dikenal.\n"
+            "Pakai: /stockbit status | /stockbit | /stockbit close"
+        )
+        return
+
+    resume = " ".join(args[1:]).strip() if sub == "login" else " ".join(args).strip()
+    if not resume:
+        resume = _STOCKBIT_RESUME.get(chat_id, "")
+    await _start_stockbit_login(update, context, resume_question=resume)
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_allowed(update, context):
+        return
+    assert update.effective_chat is not None
+    assert update.effective_message is not None
+    chat_id = update.effective_chat.id
+    if chat_id in _PENDING_STOCKBIT:
+        await _continue_stockbit_login(update, context)
+        return
     await _handle_addressed_message(update, context)
 
 
@@ -274,6 +399,10 @@ async def _handle_addressed_message(
 
     message = update.effective_message
     chat_id = update.effective_chat.id if update.effective_chat else 0
+    if chat_id in _PENDING_STOCKBIT:
+        await _continue_stockbit_login(update, context)
+        return
+
     text, entities = _text_and_entities(message)
     mentioned = _is_bot_mentioned(text, entities, context)
     replied_bot = _is_reply_to_bot(message, context)
@@ -288,13 +417,225 @@ async def _handle_addressed_message(
                 "Ya, saya di sini.\n"
                 f"Contoh: @{context.bot.username or 'bot'} ringkas BBCA 2024\n"
                 "atau /ask ringkas BBCA 2024\n"
-                "atau kirim/reply PDF lalu tanya isinya."
+                "atau /stockbit untuk login Stockbit interaktif"
             )
             return
         else:
             return
 
     await _handle_user_message(update, context, question)
+
+
+async def _start_stockbit_login(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    resume_question: str,
+) -> None:
+    assert update.effective_chat is not None
+    assert update.effective_message is not None
+    chat_id = update.effective_chat.id
+
+    if chat_id in _PENDING_STOCKBIT:
+        step = _PENDING_STOCKBIT[chat_id].get("step", "?")
+        await update.effective_message.reply_text(
+            f"Login Stockbit sudah menunggu input (step: {step}).\n"
+            "Lanjutkan kirim data atau ketik /cancel."
+        )
+        return
+
+    from agent_idx import browser_stockbit as _sb
+    from agent_idx.browser_stockbit import get_browser, run_sync
+
+    if _sb._BROWSER is not None and _sb._BROWSER.ready:
+        st = await asyncio.to_thread(run_sync, lambda: get_browser().status())
+        if "login=logged_in" in st:
+            _STOCKBIT_RESUME.pop(chat_id, None)
+            await update.effective_message.reply_text(
+                "Sudah login ke Stockbit.\nMelanjutkan permintaan..."
+            )
+            if resume_question:
+                await _handle_user_message(update, context, resume_question)
+            return
+        if "login=needs_otp" in st or "needs_otp=True" in st:
+            _PENDING_STOCKBIT[chat_id] = {
+                "step": "otp",
+                "username": None,
+                "resume": resume_question,
+            }
+            await update.effective_message.reply_text(
+                "Stockbit menunggu <b>kode verifikasi</b>.\n\n"
+                "Kirim kode OTP sekarang.\n"
+                "Ketik /cancel untuk batal.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    _PENDING_STOCKBIT[chat_id] = {
+        "step": "username",
+        "username": None,
+        "resume": resume_question,
+    }
+    await update.effective_message.reply_text(
+        "Login Stockbit (browser guest/ephemeral, hanya stockbit.com).\n\n"
+        "Kirim <b>username / email</b> Stockbit sekarang.\n"
+        "Ketik /cancel untuk batal.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _continue_stockbit_login(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    assert update.effective_chat is not None
+    assert update.effective_message is not None
+    chat_id = update.effective_chat.id
+    pending = _PENDING_STOCKBIT.get(chat_id)
+    if not pending:
+        return
+
+    text = (update.effective_message.text or "").strip()
+    if text.lower() in {"/cancel", "cancel", "batal"}:
+        _PENDING_STOCKBIT.pop(chat_id, None)
+        await update.effective_message.reply_text("Login Stockbit dibatalkan.")
+        return
+
+    step = pending.get("step")
+    if step == "username":
+        pending["username"] = text
+        pending["step"] = "password"
+        # Best-effort delete username message.
+        try:
+            await update.effective_message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Username diterima.\n"
+                "Kirim <b>password</b> Stockbit sekarang (pesan akan dihapus bila bisa).\n"
+                "/cancel untuk batal."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if step == "password":
+        username = pending.get("username") or ""
+        password = text
+        resume = pending.get("resume") or ""
+        try:
+            await update.effective_message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+
+        status = await context.bot.send_message(
+            chat_id=chat_id, text="Menjalankan login Stockbit..."
+        )
+        import os
+
+        from agent_idx.browser_stockbit import NEED_OTP, get_browser, run_sync
+
+        headless = os.getenv("STOCKBIT_HEADLESS", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+        def _login() -> str:
+            browser = get_browser(headless=headless)
+            browser.start()
+            browser.open(url="https://stockbit.com/login")
+            return browser.login(username, password)
+
+        try:
+            result = await asyncio.to_thread(run_sync, _login)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Stockbit login failed")
+            _PENDING_STOCKBIT.pop(chat_id, None)
+            await status.edit_text(f"Login gagal: {exc}")
+            return
+
+        if NEED_OTP in result:
+            pending["step"] = "otp"
+            pending["resume"] = resume
+            await status.edit_text(
+                "Password diterima. Stockbit minta <b>kode verifikasi</b> "
+                "(email / SMS / authenticator).\n\n"
+                "Kirim kode OTP sekarang.\n"
+                "/cancel untuk batal.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        _PENDING_STOCKBIT.pop(chat_id, None)
+        if result.startswith("OK:"):
+            _STOCKBIT_RESUME.pop(chat_id, None)
+            if resume and resume != _STOCKBIT_DEFAULT_RESUME:
+                await status.edit_text(
+                    "Login Stockbit berhasil.\nMelanjutkan permintaan sebelumnya..."
+                )
+                await _handle_user_message(update, context, resume)
+            else:
+                await status.edit_text(
+                    "Login Stockbit berhasil (sesi ephemeral, hilang saat bot restart).\n"
+                    "Siap dipakai — coba /ask scrape Stockbit Reports ..."
+                )
+        else:
+            await status.edit_text(
+                f"Login gagal.\n{result[:500]}\n\n"
+                "Coba /stockbit lagi. Jika ada captcha, set STOCKBIT_HEADLESS=false."
+            )
+        return
+
+    if step == "otp":
+        code = text
+        resume = pending.get("resume") or ""
+        try:
+            await update.effective_message.delete()
+        except Exception:  # noqa: BLE001
+            pass
+
+        status = await context.bot.send_message(
+            chat_id=chat_id, text="Mengirim kode verifikasi..."
+        )
+        from agent_idx.browser_stockbit import get_browser, run_sync
+
+        def _otp() -> str:
+            browser = get_browser()
+            if not browser.ready:
+                return "ERROR: browser sudah tertutup. Jalankan /stockbit lagi."
+            return browser.submit_otp(code)
+
+        try:
+            result = await asyncio.to_thread(run_sync, _otp)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Stockbit OTP failed")
+            _PENDING_STOCKBIT.pop(chat_id, None)
+            await status.edit_text(f"Verifikasi gagal: {exc}")
+            return
+
+        if result.startswith("OK:"):
+            _PENDING_STOCKBIT.pop(chat_id, None)
+            _STOCKBIT_RESUME.pop(chat_id, None)
+            if resume and resume != _STOCKBIT_DEFAULT_RESUME:
+                await status.edit_text(
+                    "Login Stockbit berhasil.\nMelanjutkan permintaan sebelumnya..."
+                )
+                await _handle_user_message(update, context, resume)
+            else:
+                await status.edit_text(
+                    "Login Stockbit berhasil (sesi ephemeral, hilang saat bot restart).\n"
+                    "Siap dipakai — coba /ask scrape Stockbit Reports ..."
+                )
+            return
+
+        # Stay on OTP step so user can retry another code.
+        pending["step"] = "otp"
+        await status.edit_text(
+            f"Kode belum diterima.\n{result[:400]}\n\n"
+            "Kirim kode verifikasi yang baru, atau /cancel lalu /stockbit ulang."
+        )
 
 
 def _text_and_entities(
@@ -386,6 +727,11 @@ def _find_pdf_document(message: Message, chat_id: int, question: str) -> Documen
 
     # 3) User refers to "pdf/dokumen/data ini" -> latest PDF seen in this chat
     if _DOC_REF.search(question or ""):
+        from agent_idx.composite_report import is_composite_report_query
+        from agent_idx.stockbit_reports import is_stockbit_scrape_query
+
+        if is_composite_report_query(question) or is_stockbit_scrape_query(question):
+            return None
         recent = _RECENT_PDFS.get(chat_id)
         if recent:
             logger.info(
@@ -408,6 +754,11 @@ async def _attach_pdf_context(
     chat_id = update.effective_chat.id
     doc = _find_pdf_document(update.effective_message, chat_id, question)
     if not doc:
+        from agent_idx.composite_report import is_composite_report_query
+        from agent_idx.stockbit_reports import is_stockbit_scrape_query
+
+        if is_composite_report_query(question) or is_stockbit_scrape_query(question):
+            return question, None
         if _DOC_REF.search(question or ""):
             return question, (
                 "Saya belum bisa mengakses file PDF-nya.\n\n"
@@ -452,14 +803,28 @@ async def _attach_pdf_context(
     return enriched, None
 
 
+async def _send_status(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+):
+    """Reply if possible; fall back to plain send (e.g. after deleted OTP message)."""
+    assert update.effective_chat is not None
+    chat_id = update.effective_chat.id
+    message = update.effective_message
+    if message is not None:
+        try:
+            return await message.reply_text(text)
+        except BadRequest:
+            pass
+    return await context.bot.send_message(chat_id=chat_id, text=text)
+
+
 async def _handle_user_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE, question: str
 ) -> None:
     assert update.effective_chat is not None
-    assert update.effective_message is not None
 
     # Ack immediately so user always sees a response.
-    status = await update.effective_message.reply_text("Sedang memproses...")
+    status = await _send_status(update, context, "Sedang memproses...")
 
     question, pdf_error = await _attach_pdf_context(update, context, question)
     if pdf_error:
@@ -476,6 +841,19 @@ async def _handle_user_message(
         history = list(_HISTORY[chat_id])
 
     logger.info("Question from chat_id=%s: %s", chat_id, question[:300])
+
+    from agent_idx.agent import _REPORTS_URL, _SCRAPE_VERB, extract_stockbit_url
+
+    if (
+        _SCRAPE_VERB.search(question)
+        and (_REPORTS_URL.search(question) or extract_stockbit_url(question))
+    ):
+        await status.edit_text(
+            "Scrape Stockbit stream sedang berjalan...\n"
+            "Scroll otomatis — rentang panjang butuh beberapa menit.\n"
+            "Mohon tunggu, jangan kirim perintah lain."
+        )
+
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     try:
         result: AgentResult = await asyncio.to_thread(agent.ask, question, history)
@@ -493,6 +871,50 @@ async def _handle_user_message(
         history_question = history_question.split("--- ISI PDF", 1)[0].strip()
         history_question += " [dengan lampiran PDF]"
 
+    if result.need_stockbit_login:
+        resume_q = result.resume_question or question
+        _STOCKBIT_RESUME[chat_id] = resume_q
+
+        if chat_id in _PENDING_STOCKBIT:
+            step = _PENDING_STOCKBIT[chat_id].get("step", "?")
+            await status.edit_text(
+                f"Stockbit butuh login.\n"
+                f"Login sedang berjalan (step: {step}). Lanjutkan atau /cancel.\n"
+                "Cek sesi: /stockbit status"
+            )
+            return
+
+        from agent_idx import browser_stockbit as _sb
+        from agent_idx.browser_stockbit import get_browser, run_sync
+
+        if _sb._BROWSER is not None and _sb._BROWSER.ready:
+            st = await asyncio.to_thread(run_sync, lambda: get_browser().status())
+            if "login=logged_in" in st:
+                _STOCKBIT_RESUME.pop(chat_id, None)
+                await status.edit_text("Sesi Stockbit masih aktif. Melanjutkan...")
+                await _handle_user_message(update, context, resume_q)
+                return
+            if "login=needs_otp" in st or "needs_otp=True" in st:
+                _PENDING_STOCKBIT[chat_id] = {
+                    "step": "otp",
+                    "username": None,
+                    "resume": resume_q,
+                }
+                await status.edit_text(
+                    "Stockbit menunggu kode OTP.\n"
+                    "Kirim kode verifikasi di chat, atau /cancel."
+                )
+                return
+
+        await status.edit_text(
+            "Stockbit membutuhkan login.\n\n"
+            "Sesi browser guest — hilang saat bot restart atau /stockbit close.\n"
+            "• /stockbit status — cek sesi\n"
+            "• /stockbit — login interaktif\n\n"
+            "Setelah login, ulangi pertanyaan tadi."
+        )
+        return
+
     answer = result.text
     _HISTORY[chat_id].append({"role": "user", "content": history_question})
     _HISTORY[chat_id].append({"role": "assistant", "content": answer})
@@ -501,7 +923,16 @@ async def _handle_user_message(
     parts = _chunk(formatted)
     await _send_html(status.edit_text, parts[0])
     for part in parts[1:]:
-        await _send_html(update.effective_message.reply_text, part)
+        msg = update.effective_message
+        if msg is not None:
+            try:
+                await _send_html(msg.reply_text, part)
+                continue
+            except BadRequest:
+                pass
+        await context.bot.send_message(
+            chat_id=chat_id, text=part, parse_mode=None
+        )
 
     for path in result.files:
         await _send_file(update, context, path)
@@ -510,16 +941,28 @@ async def _handle_user_message(
 async def _send_file(
     update: Update, context: ContextTypes.DEFAULT_TYPE, path: Path
 ) -> None:
-    assert update.effective_message is not None
     assert update.effective_chat is not None
     if not path.is_file():
         return
+    chat_id = update.effective_chat.id
     await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT
+        chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT
     )
     try:
         with path.open("rb") as fh:
-            await update.effective_message.reply_document(
+            message = update.effective_message
+            if message is not None:
+                try:
+                    await message.reply_document(
+                        document=fh,
+                        filename=path.name,
+                        caption=path.name,
+                    )
+                    return
+                except BadRequest:
+                    fh.seek(0)
+            await context.bot.send_document(
+                chat_id=chat_id,
                 document=fh,
                 filename=path.name,
                 caption=path.name,
@@ -535,7 +978,26 @@ async def _send_html(sender, text: str) -> None:
         await sender(text, parse_mode=None)
 
 
+async def _warm_stockbit_chroma(app: Application) -> None:
+    store: StockbitReportsStore | None = app.bot_data.get("stockbit_store")
+    export_dir: Path | None = app.bot_data.get("export_dir")
+    if store is None or export_dir is None:
+        return
+
+    loop = asyncio.get_running_loop()
+
+    def _sync() -> None:
+        try:
+            inserted = store.sync_from_exports(export_dir)
+            logger.info("Stockbit Chroma background sync: %s new posts ingested", inserted)
+        except Exception:
+            logger.exception("Stockbit Chroma background sync failed")
+
+    await loop.run_in_executor(None, _sync)
+
+
 async def _post_init(app: Application) -> None:
+    asyncio.create_task(_warm_stockbit_chroma(app))
     settings: Settings = app.bot_data["settings"]
     store: StockDataStore = app.bot_data["store"]
     knowledge: KnowledgeBase = app.bot_data["knowledge"]
@@ -585,6 +1047,12 @@ async def _post_shutdown(app: Application) -> None:
             logger.exception("Scheduler shutdown failed")
         else:
             logger.info("Cron stopped")
+    try:
+        from agent_idx.browser_stockbit import shutdown_browser
+
+        shutdown_browser()
+    except Exception:  # noqa: BLE001
+        logger.exception("Browser shutdown failed")
 
 
 def build_application(settings: Settings, store: StockDataStore) -> Application:
@@ -593,11 +1061,17 @@ def build_application(settings: Settings, store: StockDataStore) -> Application:
 
     knowledge = KnowledgeBase(settings.knowledge_dir)
     chat_log = ChatLog(settings.chat_db_path)
+    stockbit_store = StockbitReportsStore(
+        settings.chroma_dir,
+        export_dir=settings.export_dir,
+        auto_sync=False,
+    )
     agent = AnalystAgent(
         settings,
         store,
         knowledge=knowledge,
         chat_log=chat_log,
+        stockbit_store=stockbit_store,
         chat_id=settings.telegram_chat_id,
     )
     app = (
@@ -612,6 +1086,7 @@ def build_application(settings: Settings, store: StockDataStore) -> Application:
     app.bot_data["store"] = store
     app.bot_data["knowledge"] = knowledge
     app.bot_data["chat_log"] = chat_log
+    app.bot_data["stockbit_store"] = stockbit_store
     app.bot_data["settings"] = settings
     app.bot_data["allowed_chat_id"] = settings.telegram_chat_id
     app.bot_data["export_dir"] = settings.export_dir
@@ -622,9 +1097,11 @@ def build_application(settings: Settings, store: StockDataStore) -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("ask", ask_cmd))
+    app.add_handler(CommandHandler("stockbit", stockbit_cmd))
     app.add_handler(CommandHandler("learn", learn_cmd))
     app.add_handler(CommandHandler("chats", chats_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("range", range_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))

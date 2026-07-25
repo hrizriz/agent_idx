@@ -9,6 +9,15 @@ from agent_idx.agent import AnalystAgent
 from agent_idx.config import load_settings
 from agent_idx.data import StockDataStore
 from agent_idx.knowledge import KnowledgeBase
+from agent_idx.stockbit_store import StockbitReportsStore
+
+
+def _make_stockbit_store(settings) -> StockbitReportsStore:
+    return StockbitReportsStore(
+        settings.chroma_dir,
+        export_dir=settings.export_dir,
+        auto_sync=False,
+    )
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -21,7 +30,8 @@ def _setup_logging(verbose: bool) -> None:
 
 def cmd_cli(store: StockDataStore, settings) -> int:
     knowledge = KnowledgeBase(settings.knowledge_dir)
-    agent = AnalystAgent(settings, store, knowledge=knowledge)
+    stockbit_store = _make_stockbit_store(settings)
+    agent = AnalystAgent(settings, store, knowledge=knowledge, stockbit_store=stockbit_store)
     print("IDX Analyst CLI. Ketik pertanyaan, atau 'exit' untuk keluar.")
     print(f"Data: {store.list_date_range()}")
     print(f"LLM:  {settings.llm_base_url} model={settings.llm_model}")
@@ -62,7 +72,8 @@ def cmd_range(store: StockDataStore) -> int:
 
 def cmd_ask(store: StockDataStore, settings, question: str) -> int:
     knowledge = KnowledgeBase(settings.knowledge_dir)
-    agent = AnalystAgent(settings, store, knowledge=knowledge)
+    stockbit_store = _make_stockbit_store(settings)
+    agent = AnalystAgent(settings, store, knowledge=knowledge, stockbit_store=stockbit_store)
     result = agent.ask(question)
     print(result.text)
     for path in result.files:
@@ -94,6 +105,61 @@ def cmd_learn(store: StockDataStore, settings, which: str) -> int:
     return 0
 
 
+def cmd_gain_backtest(store: StockDataStore, settings, args) -> int:
+    from agent_idx.backtest import run_gain_scan
+
+    print(
+        run_gain_scan(
+            store,
+            settings.export_dir,
+            start_date=int(str(args.start_date).replace("-", "")[:8]),
+            min_win_rate=args.min_win_rate,
+            max_win_rate=args.max_win_rate,
+            min_trades=args.min_trades,
+            min_gain_win=args.min_gain_win,
+            min_avg_gain=args.min_avg_gain,
+            max_avg_gain=args.max_avg_gain,
+            max_hold=args.max_hold,
+            supplement_external=not args.no_supplement,
+            universe=args.universe,
+        )
+    )
+    return 0
+
+
+def cmd_backtest(store: StockDataStore, settings, args) -> int:
+    from agent_idx.backtest import run_backtest_scan
+
+    print(
+        run_backtest_scan(
+            store,
+            settings.export_dir,
+            start_date=args.start_date,
+            min_win_rate=args.min_win_rate,
+            max_win_rate=args.max_win_rate,
+            min_trades=args.min_trades,
+            supplement_external=not args.no_supplement,
+            universe=args.universe,
+        )
+    )
+    return 0
+
+
+def cmd_ma_squeeze(store: StockDataStore, settings, args) -> int:
+    from agent_idx.ma_squeeze_study import run_ma_squeeze_study
+
+    print(
+        run_ma_squeeze_study(
+            store,
+            settings.export_dir,
+            start_date=int(str(args.start_date).replace("-", "")[:8]),
+            universe=args.universe,
+            min_forward_gain=args.min_gain,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="IDX thinking-only stock analyst agent")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -114,6 +180,37 @@ def main(argv: list[str] | None = None) -> int:
         choices=["all", "market", "news", "weekly"],
     )
 
+    bt_p = sub.add_parser("backtest", help="Scan trading scenarios on parquet (large cap)")
+    bt_p.add_argument("--min-win-rate", type=float, default=0.75)
+    bt_p.add_argument("--max-win-rate", type=float, default=0.85)
+    bt_p.add_argument("--min-trades", type=int, default=15)
+    bt_p.add_argument("--start-date", default="20220101")
+    bt_p.add_argument("--universe", default="large_cap", choices=["large_cap", "all"])
+    bt_p.add_argument("--no-supplement", action="store_true", help="Skip yfinance data fill")
+
+    gain_p = sub.add_parser(
+        "backtest-gain",
+        help="Scan on-track hold + min gain 20-50 pct per trade, win rate 75-85 pct",
+    )
+    gain_p.add_argument("--min-win-rate", type=float, default=0.75)
+    gain_p.add_argument("--max-win-rate", type=float, default=0.85)
+    gain_p.add_argument("--min-trades", type=int, default=10)
+    gain_p.add_argument("--min-gain-win", type=float, default=20.0, help="Win if gain >= this pct")
+    gain_p.add_argument("--min-avg-gain", type=float, default=20.0)
+    gain_p.add_argument("--max-avg-gain", type=float, default=50.0)
+    gain_p.add_argument("--max-hold", type=int, default=63)
+    gain_p.add_argument("--start-date", default="20220101")
+    gain_p.add_argument("--universe", default="large_cap", choices=["large_cap", "all"])
+    gain_p.add_argument("--no-supplement", action="store_true")
+
+    ma_p = sub.add_parser(
+        "ma-squeeze",
+        help="Investigate if MA5/20/50/200 narrow before price rides MAs up",
+    )
+    ma_p.add_argument("--start-date", default="20220101")
+    ma_p.add_argument("--universe", default="large_cap", choices=["large_cap", "all"])
+    ma_p.add_argument("--min-gain", type=float, default=10.0, help="Min forward 20d gain pct")
+
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
 
@@ -133,6 +230,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_ask(store, settings, " ".join(args.question))
         if command == "learn":
             return cmd_learn(store, settings, args.job)
+        if command == "backtest":
+            return cmd_backtest(store, settings, args)
+        if command == "backtest-gain":
+            return cmd_gain_backtest(store, settings, args)
+        if command == "ma-squeeze":
+            return cmd_ma_squeeze(store, settings, args)
         return cmd_cli(store, settings)
     except KeyboardInterrupt:
         # Agent may be mid-flight in a worker thread; force-exit so Ctrl+C

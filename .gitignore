@@ -16,3 +16,6 @@ knowledge/news/
 knowledge/lessons/
 knowledge/notes/
 data/
+data/chroma/
+exports/stockbit/
+exports/stockbit_debug/

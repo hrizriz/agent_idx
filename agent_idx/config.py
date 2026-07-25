@@ -15,13 +15,13 @@ class Settings:
     export_dir: Path
     knowledge_dir: Path
     chat_db_path: Path
+    chroma_dir: Path
     llm_base_url: str
     llm_api_key: str
     llm_model: str
     telegram_bot_token: str
     telegram_chat_id: int | None
     max_sql_rows: int
-    max_agent_steps: int
     cron_enabled: bool
     cron_timezone: str
     cron_market: str
@@ -42,6 +42,7 @@ def load_settings() -> Settings:
     chat_db_path = Path(
         os.getenv("CHAT_DB_PATH", str(root / "data" / "telegram_chat.db"))
     )
+    chroma_dir = Path(os.getenv("CHROMA_DIR", str(root / "data" / "chroma")))
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_raw = (
         os.getenv("TELEGRAM_CHAT_ID")
@@ -60,13 +61,13 @@ def load_settings() -> Settings:
         export_dir=export_dir,
         knowledge_dir=knowledge_dir,
         chat_db_path=chat_db_path,
+        chroma_dir=chroma_dir,
         llm_base_url=os.getenv("LLM_BASE_URL", "http://localhost:18765/v1").rstrip("/"),
         llm_api_key=os.getenv("LLM_API_KEY", "sk-local"),
-        llm_model=os.getenv("LLM_MODEL", "gemini-3.5-flash-thinking"),
+        llm_model=os.getenv("LLM_MODEL", "gemini-3.6-flash-thinking"),
         telegram_bot_token=token,
         telegram_chat_id=chat_id,
         max_sql_rows=int(os.getenv("MAX_SQL_ROWS", "100")),
-        max_agent_steps=int(os.getenv("MAX_AGENT_STEPS", "10")),
         cron_enabled=cron_enabled,
         cron_timezone=os.getenv("CRON_TIMEZONE", "Asia/Jakarta"),
         # Mon-Fri 16:45 WIB market digest, 17:15 news, Sun 09:00 weekly lesson

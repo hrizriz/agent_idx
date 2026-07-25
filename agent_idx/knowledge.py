@@ -33,6 +33,17 @@ class KnowledgeBase:
                 lines.append(f"- {f.name}")
         return "\n".join(lines)
 
+    def stats(self) -> str:
+        counts: dict[str, int] = {}
+        for sub in ("curriculum", "daily", "news", "lessons", "notes"):
+            counts[sub] = len(list((self.root / sub).glob("*.md")))
+        total = sum(counts.values())
+        return (
+            f"knowledge_total={total} "
+            f"(curriculum={counts['curriculum']}, daily={counts['daily']}, "
+            f"news={counts['news']}, lessons={counts['lessons']}, notes={counts['notes']})"
+        )
+
     def save_note(self, title: str, body: str) -> str:
         title = (title or "catatan").strip()
         body = (body or "").strip()
@@ -105,3 +116,27 @@ def _best_snippet(text: str, tokens: list[str], radius: int = 280) -> str:
     if len(snippet) > 700:
         snippet = snippet[:700] + "..."
     return snippet
+
+
+_META_LEARNING = re.compile(
+    r"\b("
+    r"sejauh\s+mana|"
+    r"sudah\s+belajar|"
+    r"belajar\s+(?:apa|sejauh|mana|dimana|sampai)|"
+    r"kemampuan\s+(?:kamu|mu|bot|agent)|"
+    r"progress\s+belajar|"
+    r"apa\s+yang\s+(?:sudah\s+)?(?:kamu\s+)?(?:pelajari|dipelajari)|"
+    r"how\s+far.*learn|"
+    r"what\s+have\s+you\s+learned|"
+    r"kamu\s+(?:sudah\s+)?belajar"
+    r")\b",
+    re.I,
+)
+
+
+def is_meta_learning_query(text: str) -> bool:
+    """User asks about the bot's own learning progress — not market theory."""
+    raw = (text or "").strip()
+    if not re.search(r"\b(belajar|learn(?:ing|ed)?|knowledge\s+base)\b", raw, re.I):
+        return False
+    return bool(_META_LEARNING.search(raw))
