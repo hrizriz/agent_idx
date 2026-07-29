@@ -9,14 +9,13 @@ from urllib.parse import quote_plus, urlparse, parse_qs
 from urllib.request import Request, urlopen
 
 
-def search_news(query: str, limit: int = 5) -> str:
-    """Search recent news via Google News RSS (title + link + source + date)."""
+def search_news_items(query: str, limit: int = 5) -> list[dict]:
+    """Return structured news items (title, source, when, url)."""
     q = (query or "").strip()
     if not q:
         raise ValueError("query is required")
 
     limit = max(1, min(int(limit), 15))
-    # Prefer Indonesian finance context.
     rss_query = f"{q} saham OR IDX OR BEI"
     url = (
         "https://news.google.com/rss/search?"
@@ -38,11 +37,8 @@ def search_news(query: str, limit: int = 5) -> str:
 
     root = ET.fromstring(payload)
     items = root.findall("./channel/item")
-    if not items:
-        return f"(no rows) Tidak ada berita untuk query: {q}"
-
-    lines = [f"query={q}, results={min(limit, len(items))}"]
-    for i, item in enumerate(items[:limit], start=1):
+    out: list[dict] = []
+    for item in items[:limit]:
         title = _text(item.findtext("title"))
         link = _resolve_link(item.findtext("link") or "")
         source = _text(item.findtext("source"))
@@ -52,9 +48,28 @@ def search_news(query: str, limit: int = 5) -> str:
             when = parsedate_to_datetime(pub).strftime("%Y-%m-%d %H:%M")
         except (TypeError, ValueError, IndexError):
             pass
-        lines.append(f"{i}. {title}")
-        lines.append(f"   sumber: {source or '-'} | waktu: {when or '-'}")
-        lines.append(f"   link: {link}")
+        out.append(
+            {"title": title, "source": source, "when": when, "url": link}
+        )
+    return out
+
+
+def search_news(query: str, limit: int = 5) -> str:
+    """Search recent news via Google News RSS (title + link + source + date)."""
+    q = (query or "").strip()
+    if not q:
+        raise ValueError("query is required")
+    items = search_news_items(q, limit=limit)
+    if not items:
+        return f"(no rows) Tidak ada berita untuk query: {q}"
+
+    lines = [f"query={q}, results={len(items)}"]
+    for i, it in enumerate(items, start=1):
+        lines.append(f"{i}. {it['title']}")
+        lines.append(
+            f"   sumber: {it.get('source') or '-'} | waktu: {it.get('when') or '-'}"
+        )
+        lines.append(f"   link: {it.get('url') or '-'}")
     return "\n".join(lines)
 
 

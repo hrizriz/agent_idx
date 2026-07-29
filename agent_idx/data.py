@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -8,7 +9,7 @@ import duckdb
 
 # Columns present in daily_stock_summary parquet files.
 SCHEMA_COLUMNS: list[tuple[str, str]] = [
-    ("symbol", "Ticker code, e.g. BBCA"),
+    ("symbol", "Symbol code, e.g. BBCA"),
     ("name", "Company name"),
     ("prev_close", "Previous close price"),
     ("open_price", "Open price"),
@@ -51,6 +52,16 @@ def _to_yyyymmdd(value: str | int) -> int:
     return int(text)
 
 
+def _market_source() -> str:
+    """stockbit (default) | yahoo | all — which daily_stock_summary_*.parquet to load."""
+    raw = (os.getenv("MARKET_SOURCE") or "stockbit").strip().lower()
+    if raw in {"yahoo", "yf", "yfinance"}:
+        return "yahoo"
+    if raw in {"all", "both", "*"}:
+        return "all"
+    return "stockbit"
+
+
 class StockDataStore:
     """Read-only DuckDB access over daily_stock_summary parquet files."""
 
@@ -60,22 +71,35 @@ class StockDataStore:
         self._con = duckdb.connect(database=":memory:")
         self._register_view()
 
-    def _glob(self) -> str:
-        # Forward slashes work on Windows for DuckDB globs.
-        pattern = (self.parquet_dir / "daily_stock_summary_*.parquet").as_posix()
-        return pattern
+    def _selected_files(self) -> list[Path]:
+        if not self.parquet_dir.is_dir():
+            return []
+        all_files = sorted(self.parquet_dir.glob("daily_stock_summary_*.parquet"))
+        source = _market_source()
+        stockbit = [p for p in all_files if "_stockbit_" in p.name.lower()]
+        yahoo = [p for p in all_files if "_stockbit_" not in p.name.lower()]
+        if source == "stockbit":
+            if stockbit:
+                return stockbit
+            # Fallback so bot still boots before first Stockbit rebuild.
+            return yahoo or all_files
+        if source == "yahoo":
+            return yahoo or all_files
+        return all_files
 
     def _register_view(self) -> None:
         if not self.parquet_dir.is_dir():
             raise FileNotFoundError(f"Parquet directory not found: {self.parquet_dir}")
 
-        files = list(self.parquet_dir.glob("daily_stock_summary_*.parquet"))
+        files = self._selected_files()
         if not files:
             raise FileNotFoundError(
-                f"No daily_stock_summary_*.parquet files in {self.parquet_dir}"
+                f"No daily_stock_summary_*.parquet files in {self.parquet_dir} "
+                f"(MARKET_SOURCE={_market_source()})"
             )
 
-        pattern = self._glob().replace("'", "''")
+        listed = ", ".join("'" + p.as_posix().replace("'", "''") + "'" for p in files)
+        src = _market_source()
         # Normalize date to INTEGER YYYYMMDD (some files store it as VARCHAR).
         self._con.execute(
             f"""
@@ -83,17 +107,24 @@ class StockDataStore:
             SELECT
                 * EXCLUDE (date),
                 CAST(replace(CAST(date AS VARCHAR), '-', '') AS INTEGER) AS date
-            FROM read_parquet('{pattern}', union_by_name=true)
+            FROM read_parquet([{listed}], union_by_name=true)
             """
         )
+        self._active_files = files
+        self._active_source = src if (src != "stockbit" or any("_stockbit_" in p.name.lower() for p in files)) else "yahoo_fallback"
 
     def close(self) -> None:
         self._con.close()
 
     def describe_schema(self) -> str:
+        files = getattr(self, "_active_files", [])
+        src = getattr(self, "_active_source", _market_source())
         lines = [
-            "Table: daily_stock (view over all daily_stock_summary_*.parquet files)",
+            f"Table: daily_stock (MARKET_SOURCE={src})",
+            f"files={[p.name for p in files]}",
             "date is INTEGER YYYYMMDD - filter with e.g. date BETWEEN 20220101 AND 20221231",
+            "Preferred source: Stockbit Chartbit (daily_stock_summary_stockbit_*.parquet).",
+            "Yahoo/yfinance files are ignored when MARKET_SOURCE=stockbit and Stockbit panel exists.",
             "",
             "Columns:",
         ]
@@ -103,13 +134,20 @@ class StockDataStore:
 
     def list_date_range(self) -> str:
         row = self._con.execute(
-            "SELECT MIN(date) AS min_date, MAX(date) AS max_date, COUNT(DISTINCT date) AS trading_days "
+            "SELECT MIN(date) AS min_date, MAX(date) AS max_date, COUNT(DISTINCT date) AS trading_days, "
+            "COUNT(DISTINCT symbol) AS symbols "
             "FROM daily_stock"
         ).fetchone()
         assert row is not None
+        src = getattr(self, "_active_source", _market_source())
+        files = getattr(self, "_active_files", [])
+        names = ",".join(p.name for p in files[:3])
+        if len(files) > 3:
+            names += f",+{len(files)-3}"
         return (
-            f"min_date={row[0]}, max_date={row[1]}, trading_days={row[2]}, "
-            f"parquet_dir={self.parquet_dir}"
+            f"source={src}, min_date={row[0]}, max_date={row[1]}, "
+            f"trading_days={row[2]}, symbols={row[3]}, "
+            f"files={names}, parquet_dir={self.parquet_dir}"
         )
 
     def get_stock_history(
@@ -204,7 +242,7 @@ class StockDataStore:
         side: str = "sell",
         limit: int = 10,
     ) -> str:
-        """Rank tickers by net foreign flow (buy - sell) over a period."""
+        """Rank symbols by net foreign flow (buy - sell) over a period."""
         start = _to_yyyymmdd(start_date)
         end = _to_yyyymmdd(end_date)
         if start > end:
@@ -244,6 +282,8 @@ class StockDataStore:
                 SUM(foreign_buy) - SUM(foreign_sell) AS net_foreign
             FROM daily_stock
             WHERE date BETWEEN ? AND ?
+              AND foreign_buy IS NOT NULL
+              AND foreign_sell IS NOT NULL
             GROUP BY symbol
             {having}
             ORDER BY net_foreign {order}
@@ -257,6 +297,28 @@ class StockDataStore:
             f"(negatif = net sell)"
         )
         body = self._format_df(self._con.execute(sql, [start, end]).fetchdf())
+        # Chartbit carries no foreign fields; detect whether any real coverage exists.
+        covered = self._con.execute(
+            """
+            SELECT COUNT(*) FROM daily_stock
+            WHERE date BETWEEN ? AND ?
+              AND foreign_buy IS NOT NULL
+              AND foreign_sell IS NOT NULL
+            """,
+            [start, end],
+        ).fetchone()[0]
+        if not covered:
+            from agent_idx.transforms import foreign_flow_from_transforms
+
+            alt = foreign_flow_from_transforms(
+                start, end, side=side_norm, limit=limit
+            )
+            return (
+                f"{header}\n"
+                f"(no rows) Panel daily_stock tidak punya foreign flow nyata "
+                f"(Chartbit OHLCV → foreign_buy/sell = NULL).\n\n"
+                f"Fallback transform store:\n{alt}"
+            )
         return f"{header}\n{body}"
 
     def run_sql(self, sql: str) -> str:
@@ -312,13 +374,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "get_stock_history",
             "description": (
-                "Get daily OHLCV-style history for one ticker between dates. "
+                "Get daily OHLCV-style history for one symbol between dates. "
                 "Dates: YYYYMMDD or YYYY-MM-DD. Result is capped by MAX_SQL_ROWS."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "symbol": {"type": "string", "description": "Ticker, e.g. BBCA"},
+                    "symbol": {"type": "string", "description": "Symbol, e.g. BBCA"},
                     "start_date": {"type": "string", "description": "Start date YYYYMMDD or YYYY-MM-DD"},
                     "end_date": {"type": "string", "description": "End date YYYYMMDD or YYYY-MM-DD"},
                     "columns": {
@@ -344,7 +406,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "properties": {
                     "start_date": {"type": "string"},
                     "end_date": {"type": "string"},
-                    "symbol": {"type": "string", "description": "Optional ticker filter"},
+                    "symbol": {"type": "string", "description": "Optional symbol filter"},
                 },
                 "required": ["start_date", "end_date"],
                 "additionalProperties": False,
@@ -356,8 +418,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "rank_foreign_flow",
             "description": (
-                "Rank tickers by net foreign flow over a period. "
+                "Rank symbols by net foreign flow over a period. "
                 "net_foreign = foreign_buy - foreign_sell. "
+                "PENTING: panel Stockbit Chartbit menyimpan foreign=NULL. "
+                "Jika kosong/GAP, tool akan fallback ke foreign_flow_daily "
+                "hasil transform scrape overview (F Buy/F Sell)."
                 "side='sell' = largest net foreign sell (most negative net). "
                 "side='buy' = largest net foreign buy. "
                 "Use for questions like 'siapa net foreign sell 2026'."
@@ -374,7 +439,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Top N tickers (default 10)",
+                        "description": "Top N symbols (default 10)",
                     },
                 },
                 "required": ["start_date", "end_date"],

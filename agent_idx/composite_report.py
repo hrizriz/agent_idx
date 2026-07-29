@@ -37,6 +37,8 @@ def is_composite_report_query(text: str) -> bool:
         return False
     if re.search(r"\b(pdf|dokumen|attachment|lampiran|file)\b", raw, re.I):
         return False
+    if re.search(r"\b(chat|group|grup|diskusi|telegram|siapa\s+bilang)\b", raw, re.I):
+        return False
     if _SCRAPE_VERB.search(raw):
         return False
     if _PDF_OUTPUT.search(raw):
@@ -58,7 +60,7 @@ def gather_report_context(
     from agent_idx.decision import extract_report_focus
 
     focus = plan.focus if plan else extract_report_focus(user_message)
-    tickers = plan.tickers if plan else []
+    symbols = plan.symbols if plan else []
     wanted = set(plan.sources if plan else ["pasar", "berita", "stockbit_reports", "knowledge"])
     sections: dict[str, str] = {}
 
@@ -66,8 +68,8 @@ def gather_report_context(
         try:
             coverage = store.list_date_range()
             lines = [f"coverage={coverage}"]
-            if tickers:
-                for sym in tickers[:5]:
+            if symbols:
+                for sym in symbols[:5]:
                     try:
                         rows = store._con.execute(
                             """
@@ -83,10 +85,14 @@ def gather_report_context(
                         if rows:
                             lines.append(f"\n### {sym} (5 sesi terakhir)")
                             for r in rows:
-                                nf = (r[5] or 0) - (r[6] or 0)
+                                nf = (
+                                    f"{r[5] - r[6]:,.0f}"
+                                    if r[5] is not None and r[6] is not None
+                                    else "GAP_DATA"
+                                )
                                 lines.append(
                                     f"- {r[0]} close={r[1]} vol={r[2]:,.0f} "
-                                    f"value={r[3]:,.0f} chg={r[4]:.2f}% net_foreign={nf:,.0f}"
+                                    f"value={r[3]:,.0f} chg={r[4]:.2f}% net_foreign={nf}"
                                 )
                         else:
                             lines.append(f"\n### {sym}: (tidak ada di parquet)")
@@ -100,16 +106,21 @@ def gather_report_context(
                        value, close, change
                 FROM daily_stock, latest
                 WHERE date = latest.d
+                  AND foreign_buy IS NOT NULL
+                  AND foreign_sell IS NOT NULL
                 ORDER BY ABS(net_foreign) DESC
                 LIMIT 8
                 """
             ).fetchall()
             lines.append("\ntop_net_foreign (sesi terakhir):")
-            for row in top_flow:
-                lines.append(
-                    f"- {row[0]} {row[1] or ''}: net_foreign={row[2]:,.0f} "
-                    f"value={row[3]:,.0f} close={row[4]} chg={row[5]:.2f}%"
-                )
+            if not top_flow:
+                lines.append("- GAP_DATA: sesi terakhir tidak memiliki foreign buy/sell")
+            else:
+                for row in top_flow:
+                    lines.append(
+                        f"- {row[0]} {row[1] or ''}: net_foreign={row[2]:,.0f} "
+                        f"value={row[3]:,.0f} close={row[4]} chg={row[5]:.2f}%"
+                    )
             sections["pasar"] = "\n".join(lines)
         except Exception as exc:  # noqa: BLE001
             sections["pasar"] = f"(tidak tersedia: {exc})"
@@ -135,7 +146,7 @@ def gather_report_context(
 
     if "chat" in wanted and chat_log is not None:
         try:
-            q = tickers[0] if tickers else focus.split()[0]
+            q = symbols[0] if symbols else focus.split()[0]
             sections["chat"] = chat_log.search(q, limit=10)
         except Exception as exc:  # noqa: BLE001
             sections["chat"] = f"(tidak tersedia: {exc})"

@@ -6,7 +6,7 @@ Modul: `agent_idx/backtest.py` + `agent_idx/backtest_data.py`
 
 Menguji setup trading sederhana pada data transaksi harian IDX (parquet) dari **2022-01-01** sampai data terakhir.
 
-**Universe default:** market cap >= IDR 1 Triliun per hari (`market_cap = close × listed_shares`).
+**Cap filter default:** market cap >= IDR 1 Triliun pada **hari sinyal (entry only)**. Panel menyimpan seluruh bar kronologis per emiten agar exit +N memakai N hari bursa, termasuk bar yang tidak eligible entry.
 
 **Target win rate:** band **75–85%** (bukan hanya minimum). Skenario agregat di seluruh large cap jarang masuk band ini — hasil realistis ada di **per emiten + grid search**.
 
@@ -17,7 +17,9 @@ Menguji setup trading sederhana pada data transaksi harian IDX (parquet) dari **
 ```bash
 py -3 main.py backtest
 py -3 main.py backtest --min-win-rate 0.75 --max-win-rate 0.85 --min-trades 15
-py -3 main.py backtest --universe all --no-supplement
+py -3 main.py backtest --cap-filter all --no-supplement
+# legacy alias:
+py -3 main.py backtest --cap-filter none
 ```
 
 ### Telegram bot
@@ -29,24 +31,27 @@ py -3 main.py backtest --universe all --no-supplement
 
 ### Tool agent
 
-`run_backtest_scan(start_date, min_win_rate, max_win_rate, min_trades, min_market_cap, supplement_external, universe)`
+`run_backtest_scan(start_date, min_win_rate, max_win_rate, min_trades, min_market_cap, supplement_external, cap_filter)`
+
+(`universe` tetap diterima sebagai alias legacy di API Python.)
 
 Output:
 
 - `exports/backtest/scan_YYYYMMDD_HHMMSS.json`
 - `exports/backtest/scan_YYYYMMDD_HHMMSS.md`
-- Section **SETUP TRADING** — semua hit dalam band win rate (aggregate, grid, per emiten)
+- Section **## SETUP TRADING** — semua hit dalam band win rate (aggregate, grid, per emiten), tanpa truncasi
 
 ## Metodologi
 
-1. **Load panel** — DuckDB baca parquet, filter tanggal & market cap.
-2. **Supplement yfinance** — emiten dengan coverage parquet < 85% diisi OHLCV dari Yahoo (`.JK`). Foreign flow tidak tersedia di yfinance (di-set 0).
-3. **16 skenario bawaan** + **grid search** (drop, foreign streak, momentum, volume).
-4. **Per emiten** — skenario bawaan + grid exhaustive per symbol.
-5. **Entry** — beli **close** hari sinyal.
-6. **Exit** — jual **close** +N hari kerja.
+1. **Load panel** — DuckDB baca parquet, filter tanggal. Cap filter menandai `cap_eligible` (tidak membuang bar).
+2. **Supplement yfinance** — emiten dengan coverage absolut < 85% dari jumlah trading-date panel diisi OHLCV dari Yahoo (`.JK`). Tidak ada batas diam 150 emiten. Foreign flow tidak tersedia di yfinance → biarkan **NaN** (bukan 0).
+3. **16 skenario bawaan** + **grid search** agregat ekstra: drop, foreign streak, momentum, volume saja (breakout / MA-cross / oversold tetap di skenario bawaan, tidak di grid ekstra).
+4. **Per emiten** — skenario bawaan + grid exhaustive (termasuk keluarga volume) dengan **min_trades sama** seperti agregat (default 15).
+5. **Entry** — beli **close** hari sinyal, hanya jika `cap_eligible`.
+6. **Exit** — jual **close** +N hari bursa pada deret lengkap.
 7. **Win** — return forward > 0%.
 8. **Filter lulus** — win rate dalam band [min, max] dan trades >= threshold.
+9. **Foreign** — `net_foreign` hanya jika `foreign_buy` dan `foreign_sell` keduanya ada; sinyal foreign mensyaratkan `notna`.
 
 ## Skenario bawaan (16)
 
@@ -69,7 +74,7 @@ Output:
 | `breakout_10d` | Close > high 10 hari sebelumnya | 7d |
 | `volume_spike_3x` | Volume > 3× MA20 & close naik | 5d |
 
-Grid tambahan: `grid_drop_*`, `grid_foreign_*`, `grid_momentum_*`, `grid_vol_*`.
+Grid tambahan (agregat & per emiten): `grid_drop_*`, `grid_foreign_*`, `grid_momentum_*`, `grid_vol_*`.
 
 ## Interpretasi (penting)
 

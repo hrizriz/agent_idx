@@ -35,8 +35,9 @@ def _add_ma_features(df: pd.DataFrame) -> pd.DataFrame:
     df["ma200"] = g["close"].transform(lambda s: s.rolling(200, min_periods=200).mean())
     df["vol_ma20"] = g["volume"].transform(lambda s: s.rolling(20, min_periods=10).mean())
     df["vol_ratio"] = df["volume"] / df["vol_ma20"]
-    df["nf"] = df["foreign_buy"].fillna(0) - df["foreign_sell"].fillna(0)
-    df["nf_pos"] = df["nf"] > 0
+    foreign_known = df["foreign_buy"].notna() & df["foreign_sell"].notna()
+    df["nf"] = (df["foreign_buy"] - df["foreign_sell"]).where(foreign_known)
+    df["nf_pos"] = (df["nf"] > 0).where(foreign_known)
 
     mas = df[["ma5", "ma20", "ma50", "ma200"]]
     df["ma_max"] = mas.max(axis=1)
@@ -135,7 +136,7 @@ def investigate_ma_squeeze(
     *,
     start_date: int = DEFAULT_START,
     min_market_cap: float = MIN_MARKET_CAP,
-    universe: str = "large_cap",
+    cap_filter: str = "large_cap",
     min_forward_gain: float = MIN_FORWARD_GAIN,
     sample_control: int = 50_000,
 ) -> dict:
@@ -143,7 +144,7 @@ def investigate_ma_squeeze(
         store,
         start_date=start_date,
         min_market_cap=min_market_cap,
-        universe=universe,
+        cap_filter=cap_filter,
         supplement_external=False,
     )
     panel = _add_ma_features(panel)
@@ -234,7 +235,7 @@ def investigate_ma_squeeze(
     return {
         "start_date": start_date,
         "end_date": int(ready["date"].max()) if len(ready) else None,
-        "universe": universe,
+        "cap_filter": cap_filter,
         "panel_rows": int(len(panel)),
         "ready_rows": int(len(ready)),
         "n_onset": int(len(onset)),
@@ -271,7 +272,7 @@ def format_ma_squeeze_report(payload: dict) -> str:
     lines = [
         "OK: investigasi MA squeeze sebelum naik ikut MA selesai",
         f"Periode: {payload['start_date']} .. {payload['end_date']}",
-        f"Universe: {payload['universe']} | ready rows: {payload['ready_rows']:,}",
+        f"Cap filter: {payload['cap_filter']} | ready rows: {payload['ready_rows']:,}",
         f"Event: onset stacked MA5>20>50>200 + close di atas semua MA",
         f"Sukses = return +{payload['forward_days']}d >= {payload['min_forward_gain_pct']}%",
         f"Onset total: {payload['n_onset']:,} | sukses: {payload['n_successful_onset']:,} | gagal: {payload['n_failed_onset']:,}",

@@ -20,12 +20,12 @@ class KnowledgeBase:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        for sub in ("curriculum", "daily", "news", "lessons", "notes"):
+        for sub in ("curriculum", "daily", "news", "lessons", "notes", "docs"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
 
     def list_topics(self) -> str:
         lines = [f"knowledge_root={self.root}"]
-        for sub in ("curriculum", "daily", "news", "lessons", "notes"):
+        for sub in ("curriculum", "daily", "news", "lessons", "notes", "docs"):
             folder = self.root / sub
             files = sorted(folder.glob("*.md"))
             lines.append(f"\n## {sub} ({len(files)} files)")
@@ -35,13 +35,14 @@ class KnowledgeBase:
 
     def stats(self) -> str:
         counts: dict[str, int] = {}
-        for sub in ("curriculum", "daily", "news", "lessons", "notes"):
+        for sub in ("curriculum", "daily", "news", "lessons", "notes", "docs"):
             counts[sub] = len(list((self.root / sub).glob("*.md")))
         total = sum(counts.values())
         return (
             f"knowledge_total={total} "
             f"(curriculum={counts['curriculum']}, daily={counts['daily']}, "
-            f"news={counts['news']}, lessons={counts['lessons']}, notes={counts['notes']})"
+            f"news={counts['news']}, lessons={counts['lessons']}, "
+            f"notes={counts['notes']}, docs={counts['docs']})"
         )
 
     def save_note(self, title: str, body: str) -> str:
@@ -128,7 +129,8 @@ _META_LEARNING = re.compile(
     r"apa\s+yang\s+(?:sudah\s+)?(?:kamu\s+)?(?:pelajari|dipelajari)|"
     r"how\s+far.*learn|"
     r"what\s+have\s+you\s+learned|"
-    r"kamu\s+(?:sudah\s+)?belajar"
+    r"kamu\s+(?:sudah\s+)?belajar|"
+    r"topik\s+knowledge|knowledge\s+base|list\s+knowledge|inventaris\s+knowledge"
     r")\b",
     re.I,
 )

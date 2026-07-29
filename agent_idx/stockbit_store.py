@@ -18,10 +18,24 @@ _META_RE = {
 }
 _RUNS_FILE = "scrape_runs.json"
 _COLLECTION = "stockbit_reports"
+# @StockbitReports + official @Stockbit stream markdown exports
+_STREAM_MD_GLOBS = ("StockbitReports_*.md", "Stockbit_*.md")
+
+
+def iter_stream_markdown(folder: Path):
+    """Yield scraped stream markdown files (Reports + official)."""
+    seen: set[Path] = set()
+    for pattern in _STREAM_MD_GLOBS:
+        for path in sorted(folder.glob(pattern)):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            yield path
 
 
 class StockbitReportsStore:
-    """ChromaDB vector store for scraped Stockbit Reports stream posts."""
+    """ChromaDB vector store for scraped Stockbit stream posts."""
 
     def __init__(
         self,
@@ -92,7 +106,7 @@ class StockbitReportsStore:
             return 0
         self._ensure_client()
         total = 0
-        for path in sorted(folder.glob("StockbitReports_*.md")):
+        for path in iter_stream_markdown(folder):
             total += self.ingest_markdown(path)
         return total
 
@@ -175,7 +189,7 @@ class StockbitReportsStore:
         if self._collection is None:
             folder = (self.export_dir or Path(".")) / "stockbit"
             md_count = (
-                len(list(folder.glob("StockbitReports_*.md"))) if folder.is_dir() else 0
+                len(list(iter_stream_markdown(folder))) if folder.is_dir() else 0
             )
             lines = [
                 f"stockbit_vector={self.chroma_dir} (ChromaDB, warming up)",
@@ -313,7 +327,7 @@ class StockbitReportsStore:
             )
 
         rows: list[dict[str, str]] = []
-        for path in sorted(folder.glob("StockbitReports_*.md"), reverse=True):
+        for path in sorted(iter_stream_markdown(folder), reverse=True):
             text = path.read_text(encoding="utf-8", errors="ignore")
             for rec in _parse_markdown_posts(text, str(path.resolve())):
                 if rec.get("posted_date") == target_date:

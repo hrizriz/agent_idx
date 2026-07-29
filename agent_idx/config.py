@@ -27,6 +27,14 @@ class Settings:
     cron_market: str
     cron_news: str
     cron_weekly: str
+    cron_farm: str
+    cron_farm_timeframes: str
+    cron_farm_sync_daily: bool
+    cron_reports: str
+    cron_reports_days: int
+    cron_fundamentals: str
+    cron_fundamentals_rest: str
+    fundamentals_top_n: int
 
 
 def load_settings() -> Settings:
@@ -56,6 +64,13 @@ def load_settings() -> Settings:
         "yes",
         "on",
     }
+    farm_sync = os.getenv("CRON_FARM_SYNC_DAILY", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    reports_days = int(os.getenv("CRON_REPORTS_DAYS", "3"))
     return Settings(
         parquet_dir=parquet_dir,
         export_dir=export_dir,
@@ -70,8 +85,20 @@ def load_settings() -> Settings:
         max_sql_rows=int(os.getenv("MAX_SQL_ROWS", "100")),
         cron_enabled=cron_enabled,
         cron_timezone=os.getenv("CRON_TIMEZONE", "Asia/Jakarta"),
-        # Mon-Fri 16:45 WIB market digest, 17:15 news, Sun 09:00 weekly lesson
-        cron_market=os.getenv("CRON_MARKET", "45 16 * * 1-5"),
-        cron_news=os.getenv("CRON_NEWS", "15 17 * * 1-5"),
-        cron_weekly=os.getenv("CRON_WEEKLY", "0 9 * * 0"),
+        # Weekday fields use day names: APScheduler counts 0=Monday, so numeric
+        # crontab ranges written for 0=Sunday land one day late.
+        # Mon-Fri: market 16:45, Stockbit streams 16:50, Chartbit 17:00, news 17:15
+        cron_market=os.getenv("CRON_MARKET", "45 16 * * mon-fri"),
+        cron_news=os.getenv("CRON_NEWS", "15 17 * * mon-fri"),
+        cron_weekly=os.getenv("CRON_WEEKLY", "0 9 * * sun"),
+        cron_farm=os.getenv("CRON_FARM", "0 17 * * mon-fri"),
+        cron_farm_timeframes=os.getenv("CRON_FARM_TIMEFRAMES", "1H,1D"),
+        cron_farm_sync_daily=farm_sync,
+        cron_reports=os.getenv("CRON_REPORTS", "50 16 * * mon-fri"),
+        cron_reports_days=max(1, min(reports_days, 90)),
+        # The full universe takes most of a day, so it is split in two:
+        # Friday 07:00 the top tier, Saturday 07:00 everything else.
+        cron_fundamentals=os.getenv("CRON_FUNDAMENTALS", "0 7 * * fri"),
+        cron_fundamentals_rest=os.getenv("CRON_FUNDAMENTALS_REST", "0 7 * * sat"),
+        fundamentals_top_n=max(1, int(os.getenv("FUNDAMENTALS_TOP_N", "200"))),
     )

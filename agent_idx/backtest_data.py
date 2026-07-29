@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -14,7 +15,7 @@ def _yyyymmdd_to_date(n: int) -> str:
 
 
 def fetch_yfinance_symbol(symbol: str, start_date: int, end_date: int) -> pd.DataFrame:
-    """Fetch daily OHLCV from Yahoo Finance for IDX ticker (SYMBOL.JK)."""
+    """Fetch daily OHLCV from Yahoo Finance for an IDX Symbol (`SYMBOL.JK`)."""
     try:
         import yfinance as yf
     except ImportError as exc:
@@ -23,11 +24,11 @@ def fetch_yfinance_symbol(symbol: str, start_date: int, end_date: int) -> pd.Dat
         ) from exc
 
     sym = symbol.strip().upper()
-    ticker = f"{sym}.JK"
+    yahoo_symbol = f"{sym}.JK"
     start = _yyyymmdd_to_date(start_date)
     end = _yyyymmdd_to_date(end_date)
     raw = yf.download(
-        ticker,
+        yahoo_symbol,
         start=start,
         end=end,
         progress=False,
@@ -53,8 +54,9 @@ def fetch_yfinance_symbol(symbol: str, start_date: int, end_date: int) -> pd.Dat
     out["volume"] = out.get("volume", out.get("Volume", 0)).fillna(0)
     out["prev_close"] = out.groupby("symbol")["close"].shift(1)
     out["change"] = (out["close"] / out["prev_close"] - 1) * 100
-    out["foreign_buy"] = 0.0
-    out["foreign_sell"] = 0.0
+    # yfinance has no IDX foreign flow — leave NaN (never invent 0).
+    out["foreign_buy"] = np.nan
+    out["foreign_sell"] = np.nan
     out["listed_shares"] = None
     out["value"] = out["close"] * out["volume"]
     out["market_cap"] = None

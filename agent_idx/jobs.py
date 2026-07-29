@@ -44,9 +44,7 @@ def job_daily_market_digest(store: StockDataStore, knowledge: KnowledgeBase) -> 
 
     top_value = store._con.execute(
         """
-        SELECT symbol, name, value, volume, close, change,
-               foreign_buy, foreign_sell,
-               foreign_buy - foreign_sell AS net_foreign
+        SELECT symbol, name, value, volume, close, change
         FROM daily_stock
         WHERE date = ?
         ORDER BY value DESC
@@ -93,6 +91,16 @@ def job_daily_market_digest(store: StockDataStore, knowledge: KnowledgeBase) -> 
     ).fetchdf()
 
     now = datetime.now(WIB).strftime("%Y-%m-%d %H:%M %Z")
+    top_sell_text = (
+        top_sell.to_string(index=False)
+        if not top_sell.empty
+        else "GAP_DATA: sesi ini tidak memiliki foreign buy/sell"
+    )
+    top_buy_text = (
+        top_buy.to_string(index=False)
+        if not top_buy.empty
+        else "GAP_DATA: sesi ini tidak memiliki foreign buy/sell"
+    )
     lines = [
         f"# Daily Market Digest — {latest}",
         "",
@@ -111,12 +119,12 @@ def job_daily_market_digest(store: StockDataStore, knowledge: KnowledgeBase) -> 
         "",
         "## Top net foreign sell",
         "```",
-        top_sell.to_string(index=False),
+        top_sell_text,
         "```",
         "",
         "## Top net foreign buy",
         "```",
-        top_buy.to_string(index=False),
+        top_buy_text,
         "```",
         "",
         "## Top return (value > 10M)",
@@ -227,6 +235,184 @@ def job_weekly_lesson(knowledge: KnowledgeBase) -> Path:
     out = knowledge.root / "lessons" / f"weekly_{stamp}.md"
     out.write_text("\n".join(parts), encoding="utf-8")
     logger.info("Wrote weekly lesson %s", out)
+    return out
+
+
+def job_daily_chart_farm(
+    knowledge: KnowledgeBase,
+    *,
+    timeframes: str | list[str] = "1H,1D",
+    sync_daily: bool = True,
+    on_progress=None,
+) -> Path:
+    """Farm Stockbit Chartbit OHLCV for all symbols; write a text summary."""
+    from agent_idx import chart_farm
+
+    if isinstance(timeframes, str):
+        tfs = [t.strip().upper() for t in timeframes.split(",") if t.strip()]
+    else:
+        tfs = [str(t).strip().upper() for t in timeframes if str(t).strip()]
+    if not tfs:
+        tfs = ["1H", "1D"]
+
+    symbols = chart_farm.load_symbols()
+    now = datetime.now(WIB)
+    stamp = now.strftime("%Y%m%d")
+    header = [
+        f"# Daily Chartbit Farm — {stamp}",
+        "",
+        f"Generated: {now.strftime('%Y-%m-%d %H:%M %Z')}",
+        f"symbols={len(symbols)} timeframes={','.join(tfs)} sync_daily={sync_daily}",
+        "source=https://stockbit.com/symbol/{TICKER}/chartbit",
+        "",
+    ]
+
+    summary = chart_farm.run_farm(
+        symbols,
+        tfs,
+        sync_daily=bool(sync_daily),
+        on_progress=on_progress,
+    )
+    out_dir = knowledge.root / "daily"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"farm_{stamp}.md"
+    path.write_text("\n".join(header) + summary + "\n", encoding="utf-8")
+    logger.info("Wrote chart farm summary %s", path)
+    return path
+
+
+def job_weekly_stockbit_fundamentals(
+    export_dir: Path,
+    *,
+    sections: list[str] | None = None,
+    tier: str | None = None,
+    on_progress=None,
+) -> Path:
+    """Farm deep fundamentals for one tier of the IDX universe."""
+    from agent_idx import fund_farm, universe
+
+    secs = fund_farm.normalize_sections(
+        sections or ["financials", "keystats", "profile"]
+    )
+    tier_name, symbols = universe.resolve_tier(tier)
+    tiers = universe.load_tiers()
+    now = datetime.now(WIB)
+    stamp = now.strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(export_dir) / "stockbit"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    header = [
+        f"# Weekly Stockbit Fundamentals Farm — {stamp}",
+        "",
+        f"Generated: {now.strftime('%Y-%m-%d %H:%M %Z')}",
+        f"tier={tier_name} symbols={len(symbols)} sections={','.join(secs)}",
+        f"ranking={tiers.get('basis')} ({tiers.get('basis_note')})",
+        "source=https://stockbit.com/symbol/{TICKER}/"
+        "{financials|keystats|profile}",
+        "pace=sequential + jitter; stop on login/OTP",
+        "",
+    ]
+    summary = fund_farm.run_fund_farm(
+        symbols,
+        secs,
+        on_progress=on_progress,
+    )
+    try:
+        from agent_idx.pg_export import export_fundamentals
+
+        summary += "\n\n" + export_fundamentals()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Postgres export after fundamentals farm failed")
+        summary += f"\n\nexport fundamentals GAGAL: {exc}"
+
+    path = out_dir / f"fundamentals_farm_{tier_name}_{stamp}.md"
+    path.write_text("\n".join(header) + summary + "\n", encoding="utf-8")
+    logger.info("Wrote weekly Stockbit fundamentals summary %s", path)
+    return path
+
+
+def job_daily_stockbit_reports(
+    export_dir: Path,
+    *,
+    days: int = 3,
+    url: str | None = None,
+    urls: list[str] | None = None,
+    stockbit_store=None,
+) -> Path:
+    """Scrape Stockbit stream profiles and optionally ingest into Chroma.
+
+    Default farms both @StockbitReports and official @Stockbit
+    (https://stockbit.com/Stockbit — often mid-day foreign flow).
+    """
+    import os
+    import re
+
+    from agent_idx.browser_stockbit import OFFICIAL_URL, REPORTS_URL, get_browser, run_sync
+
+    days = max(1, min(int(days), 90))
+    if urls:
+        targets = [u.strip() for u in urls if u and str(u).strip()]
+    elif url:
+        targets = [url.strip()]
+    else:
+        targets = [REPORTS_URL, OFFICIAL_URL]
+    export_dir = Path(export_dir)
+    stockbit_export = export_dir / "stockbit"
+    stockbit_export.mkdir(parents=True, exist_ok=True)
+
+    headless = os.getenv("STOCKBIT_HEADLESS", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    profile = os.getenv("STOCKBIT_PROFILE_DIR", "").strip() or None
+    if not profile:
+        root = Path(__file__).resolve().parent.parent
+        profile = str(root / "data" / "stockbit_profile")
+
+    def _scrape_all() -> str:
+        browser = get_browser(headless=headless, user_data_dir=profile)
+        if not browser.ready:
+            browser.start()
+        parts: list[str] = []
+        for target in targets:
+            part = browser.scrape_reports_stream(days=days, url=target)
+            parts.append(part)
+        return "\n\n".join(parts)
+
+    result = run_sync(_scrape_all)
+    now = datetime.now(WIB)
+    stamp = now.strftime("%Y%m%d")
+    summary_lines = [
+        f"# Daily Stockbit Stream Farm — {stamp}",
+        "",
+        f"Generated: {now.strftime('%Y-%m-%d %H:%M %Z')}",
+        f"urls={targets}",
+        f"days={days}",
+        "",
+        result[:20000],
+        "",
+    ]
+
+    inserted = 0
+    file_re = re.compile(r"^FILE:\s*(.+)\s*$", re.M)
+    if stockbit_store is not None and "NEED_STOCKBIT" not in result:
+        for match in file_re.finditer(result or ""):
+            path = Path(match.group(1).strip().strip('"'))
+            if path.is_file():
+                try:
+                    inserted += int(stockbit_store.ingest_markdown(path) or 0)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Ingest failed for %s", path)
+                    summary_lines.append(f"ingest_error {path.name}: {exc}")
+        summary_lines.append(f"chroma_ingested={inserted}")
+
+    out = stockbit_export / f"reports_farm_{stamp}.md"
+    out.write_text("\n".join(summary_lines), encoding="utf-8")
+    logger.info("Wrote Stockbit stream farm summary %s", out)
+    if "NEED_STOCKBIT" in result:
+        raise RuntimeError(result.split("\n", 1)[0])
     return out
 
 
