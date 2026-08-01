@@ -51,6 +51,7 @@ SYMBOL_SLEEP = (4.0, 9.0)  # between Symbols
 ProgressFn = Callable[[str], None]
 
 _PENDING_JOBS: dict[int, dict] = {}
+WIB = ZoneInfo("Asia/Jakarta")
 
 
 def normalize_sections(raw: str | list[str] | None) -> list[str]:
@@ -72,6 +73,81 @@ def normalize_sections(raw: str | list[str] | None) -> list[str]:
 def _sleep_range(lo_hi: tuple[float, float]) -> None:
     lo, hi = lo_hi
     time.sleep(random.uniform(lo, hi))
+
+
+def sidecar_freshness(
+    symbol: str,
+    sections: list[str] | None = None,
+    *,
+    now: datetime | None = None,
+) -> dict:
+    """Describe the latest successful fundamentals Scrape from its Sidecar."""
+    sym = (symbol or "").strip().upper()
+    requested = set(normalize_sections(sections))
+    path = FUND_DIR / f"{sym}.json"
+    out = {
+        "symbol": sym,
+        "fresh": False,
+        "age_days": None,
+        "scraped_at": None,
+        "sections_complete": False,
+        "reason": "GAP_DATA: sidecar missing",
+    }
+    if not path.is_file():
+        return out
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        out["reason"] = "GAP_DATA: sidecar unreadable"
+        return out
+
+    scraped_raw = str(data.get("scraped_at") or "").strip()
+    stored_sections = set(normalize_sections(data.get("sections") or []))
+    out["scraped_at"] = scraped_raw or None
+    out["sections_complete"] = requested.issubset(stored_sections)
+    if not out["sections_complete"]:
+        missing = sorted(requested - stored_sections)
+        out["reason"] = f"GAP_DATA: missing sections {','.join(missing)}"
+        return out
+    try:
+        scraped = datetime.fromisoformat(scraped_raw.replace("Z", "+00:00"))
+        if scraped.tzinfo is None:
+            scraped = scraped.replace(tzinfo=WIB)
+        scraped = scraped.astimezone(WIB)
+    except ValueError:
+        out["reason"] = "GAP_DATA: invalid scraped_at"
+        return out
+
+    current = (now or datetime.now(WIB)).astimezone(WIB)
+    age_days = max(0, (current.date() - scraped.date()).days)
+    out["age_days"] = age_days
+    out["fresh"] = True
+    out["reason"] = "ok"
+    return out
+
+
+def filter_fresh_symbols(
+    symbols: list[str],
+    sections: list[str] | None = None,
+    *,
+    fresh_days: int = 7,
+    now: datetime | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return (to_scrape, skipped_fresh), using calendar days in WIB."""
+    days = max(0, int(fresh_days or 0))
+    picked = [(s or "").strip().upper() for s in symbols if (s or "").strip()]
+    if days <= 0:
+        return picked, []
+    stale: list[str] = []
+    fresh: list[str] = []
+    for sym in picked:
+        status = sidecar_freshness(sym, sections, now=now)
+        age = status.get("age_days")
+        if status.get("sections_complete") and age is not None and age < days:
+            fresh.append(sym)
+        else:
+            stale.append(sym)
+    return stale, fresh
 
 
 def _extract_quote_hint(text: str) -> dict:
@@ -186,12 +262,19 @@ def run_fund_farm(
     *,
     headless: bool | None = None,
     on_progress: ProgressFn | None = None,
+    skip_fresh_days: int = 7,
 ) -> str:
     from agent_idx.browser_stockbit import NEED_CREDENTIALS, NEED_OTP
 
     secs = normalize_sections(sections)
+    symbols, skipped_fresh = filter_fresh_symbols(
+        symbols, secs, fresh_days=skip_fresh_days
+    )
     if not symbols:
-        return "ERROR: tidak ada simbol (cek data/symbols_list.txt)"
+        return (
+            f"Fund farm: 0 perlu di-scrape; SKIP_FRESH={len(skipped_fresh)} "
+            f"(fresh < {max(0, int(skip_fresh_days or 0))} hari, sections lengkap)."
+        )
 
     def progress(msg: str) -> None:
         logger.info("[fund_farm] %s", msg)
@@ -253,6 +336,7 @@ def run_fund_farm(
 
     summary = [
         f"Fund farm selesai: OK={len(ok)} gagal={len(failed)} dari {total}",
+        f"SKIP_FRESH={len(skipped_fresh)} fresh_days={max(0, int(skip_fresh_days or 0))}",
         f"sections={','.join(secs)}",
         f"markdown=exports/stockbit/  json=data/fundamentals/",
         "pace=polite (jitter antar emiten; stop on login/OTP)",
@@ -290,20 +374,34 @@ def stage_fund_job(
     chat_key: int,
     symbols: list[str],
     sections: list[str],
+    *,
+    skip_fresh_days: int = 7,
 ) -> str:
-    est_min = estimate_minutes(symbols, sections)
+    picked, skipped_fresh = filter_fresh_symbols(
+        symbols, sections, fresh_days=skip_fresh_days
+    )
+    if not picked:
+        return (
+            f"SKIP_FRESH: semua {len(skipped_fresh)} simbol masih fresh "
+            f"(< {max(0, int(skip_fresh_days or 0))} hari) dan sections lengkap. "
+            "Tidak ada Staged action dibuat. Gunakan force=true untuk scrape ulang."
+        )
+    est_min = estimate_minutes(picked, sections)
     job = {
         "kind": "fundamentals",
-        "symbols": symbols[:MAX_SYMBOLS_PER_JOB],
+        "symbols": picked[:MAX_SYMBOLS_PER_JOB],
         "sections": sections,
+        "skip_fresh_days": max(0, int(skip_fresh_days or 0)),
+        "skipped_fresh": skipped_fresh,
         "est_min": est_min,
     }
     _PENDING_JOBS[chat_key] = job
-    preview = ", ".join(symbols[:15]) + ("..." if len(symbols) > 15 else "")
+    preview = ", ".join(picked[:15]) + ("..." if len(picked) > 15 else "")
     return (
         "STAGED (menunggu konfirmasi user)\n"
-        f"job=farm_stockbit_fundamentals simbol={len(symbols)} "
+        f"job=farm_stockbit_fundamentals simbol={len(picked)} "
         f"sections={','.join(sections)}\n"
+        f"skip_fresh={len(skipped_fresh)} (< {max(0, int(skip_fresh_days or 0))} hari)\n"
         f"estimasi≈{_fmt_duration(est_min)} (pace pelan, anti-spam Stockbit)\n"
         f"daftar: {preview}\n"
         "CATATAN: scrape BELUM jalan. Setujui (ya/tidak) di Telegram."
@@ -334,6 +432,8 @@ def describe_pending_job(chat_key: int) -> str:
         "Job farm fundamentals Stockbit menunggu konfirmasi:\n"
         f"• simbol: {len(symbols)} ({preview})\n"
         f"• sections: {', '.join(job['sections'])}\n"
+        f"• skip fresh: {len(job.get('skipped_fresh') or [])} "
+        f"(< {job.get('skip_fresh_days', 0)} hari)\n"
         f"• estimasi: ~{_fmt_duration(job['est_min'])} (pace pelan)\n"
         f"• output: exports/stockbit/*.md + data/fundamentals/{{SYM}}.json"
     )
@@ -351,4 +451,5 @@ def run_pending_job(chat_key: int, *, on_progress: ProgressFn | None = None) -> 
         job["symbols"],
         job["sections"],
         on_progress=on_progress,
+        skip_fresh_days=job.get("skip_fresh_days", 7),
     )

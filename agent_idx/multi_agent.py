@@ -53,6 +53,7 @@ RESEARCHER_TOOL_NAMES = frozenset(
         "get_stockbit_ohlcv",
         "get_technicals",
         "get_fundamentals",
+        "analyze_stock",
         "search_news_sentiment",
         "run_data_transform",
         "rebuild_market_from_stockbit",
@@ -85,7 +86,9 @@ ATURAN
   sebagai "harga sekarang".
 - Foreign flow: jika tool bilang GAP_DATA / NULL, JANGAN mengarang net buy.
   Arahkan scrape overview + run_data_transform / get_fundamentals.
-- Untuk teknikal wajib sebut MA5/MA20/MA50/MA200 dari get_technicals bila relevan.
+- Untuk analisis emiten: utamakan analyze_stock(symbol, horizon).
+  Sebut freshness, konflik, dan GAP_DATA/STALE_DATA dari outputnya.
+  Drill-down MA/RSI lewat get_technicals bila perlu angka bar detail.
 - Sentimen berita: search_news_sentiment (bukan mengarang positif/negatif).
 - Jika data Stockbit tertinggal: get_stockbit_ohlcv(symbol, timeframes='1D', refresh=true)
   atau rebuild_market_from_stockbit / chart_features.

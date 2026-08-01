@@ -245,7 +245,7 @@ def job_daily_chart_farm(
     sync_daily: bool = True,
     on_progress=None,
 ) -> Path:
-    """Farm Stockbit Chartbit OHLCV for all symbols; write a text summary."""
+    """Farm OHLCV via tvkit for all symbols; write a text summary."""
     from agent_idx import chart_farm
 
     if isinstance(timeframes, str):
@@ -259,11 +259,11 @@ def job_daily_chart_farm(
     now = datetime.now(WIB)
     stamp = now.strftime("%Y%m%d")
     header = [
-        f"# Daily Chartbit Farm — {stamp}",
+        f"# Daily Chart Farm (tvkit) — {stamp}",
         "",
         f"Generated: {now.strftime('%Y-%m-%d %H:%M %Z')}",
         f"symbols={len(symbols)} timeframes={','.join(tfs)} sync_daily={sync_daily}",
-        "source=https://stockbit.com/symbol/{TICKER}/chartbit",
+        "source=tvkit IDX:{TICKER}",
         "",
     ]
 
@@ -319,7 +319,9 @@ def job_weekly_stockbit_fundamentals(
     )
     try:
         from agent_idx.pg_export import export_fundamentals
+        from agent_idx.transforms import run_data_transform
 
+        summary += "\n\n" + run_data_transform(scope="fundamentals")
         summary += "\n\n" + export_fundamentals()
     except Exception as exc:  # noqa: BLE001
         logger.exception("Postgres export after fundamentals farm failed")

@@ -145,9 +145,11 @@ KEMAMPUAN TOOLS
   stockbit_status, stockbit_open, stockbit_read, stockbit_scrape, stockbit_scrape_reports,
   stockbit_create_post (publish ide ke stream — di-stage, konfirmasi ya/tidak).
   Tanpa order/trading. Cek stockbit_status dulu jika ragu sesi login.
-  Chart OHLCV: tool UTAMA get_stockbit_ohlcv / get_technicals
-  (MA5, MA20, MA50, MA200 + RSI/MACD — data pasar = teknikal).
-  Fundamental: get_fundamentals (hasil transform keystats/profile).
+  Analisis emiten (technical + fundamental): tool UTAMA analyze_stock
+  (horizon=intraday|swing|position). Output JSON sinyal per dimensi + freshness
+  + conflicts + GAP_DATA/STALE_DATA — BUKAN buy/sell. Agent menyintesis narasi.
+  Drill-down: get_stockbit_ohlcv / get_technicals (MA5/20/50/200 + RSI/MACD)
+  dan get_fundamentals (keystats/profile transform).
   Berita + sentimen: search_news_sentiment (positif/negatif/neutral).
   Setelah farm/scrape: run_data_transform(scope='technicals'|'fundamentals'|'news'|'all').
   Foreign flow: Chartbit TIDAK punya F Buy/F Sell (NULL di daily_stock).
@@ -167,6 +169,8 @@ KEMAMPUAN TOOLS
 - Fundamentals/profile Stockbit: farm_stockbit_fundamentals
   (overview,keystats,financials,profile; company hanya alias input) — pace PELAN + jitter; batch kecil
   (limit/offset). Output exports/stockbit/ + data/fundamentals/.
+  Default skip Sidecar lengkap yang di-scrape <7 hari; force=true hanya jika user
+  eksplisit minta scrape ulang data fresh.
   Universe dipecah dua: tier='top' (200 emiten terbesar) dan tier='rest' (sisanya).
   Jika user minta "semua emiten", tawarkan tier='top' dulu — 'all' makan ~26 jam.
 - Jika user minta scrape Stockbit Reports / @Stockbit / Stream official: WAJIB
@@ -199,11 +203,22 @@ ATURAN KEPUTUSAN
 
 ATURAN DATA
 - WAJIB tools untuk fakta angka/berita/knowledge. Jangan mengarang.
+- Angka yang tool tidak sediakan = tulis GAP_DATA (wajib). Dilarang mengisi
+  dari memori model: free float, jumlah saham, market cap, PBV historis,
+  SBN yield, USDIDR, statistik PHK/pengangguran, nama pejabat, proyeksi
+  pejabat, afiliasi grup usaha — kecuali ada di output tool/PDF user.
+- Jika QUERY PLAN bilang news_gap / fundamentals_tools / ownership_osint:
+  utamakan allowed_tools; kalau hasil kosong → GAP_DATA + bilang sumber mana
+  yang dicek, jangan spekulasi angka.
+- Hitung turunan (mis. 5% × shares × close) HANYA dari angka tool yang
+  eksplisit; jika shares atau close GAP_DATA, hasilnya juga GAP_DATA.
 - date = INTEGER YYYYMMDD. net_foreign = foreign_buy - foreign_sell.
 - Data transaksi BUKAN laporan keuangan.
 - HARGA SEKARANG = close bar TERAKHIR + tanggalnya saja (dari tools / blok FAKTA HARGA).
   JANGAN pakai rentang multi-hari (mis. "855–875") sebagai harga terkini.
   Kalau ada blok FAKTA HARGA TERKINI di pesan: WAJIB pakai angka itu.
+  Kalau max_date di store lebih tua dari yang user sebut: akui STALE_DATA /
+  sebut tanggal store — jangan memaksa seolah data hari itu ada.
 
 GAYA
 - Bahasa Indonesia baku, profesional, netral, ringkas.
@@ -221,7 +236,7 @@ KONTEKS PERCAKAPAN
   soal bot, JANGAN tarik data pasar atau lanjut topik saham sebelumnya.
 - Cron yang sudah ada (bukan dibuat dari chat): market digest,
   **Stockbit stream farm** (CRON_REPORTS → @StockbitReports + https://stockbit.com/Stockbit),
-  **Chartbit farm** (CRON_FARM), news digest, weekly lesson — lihat /learn / .env.
+  **Chart farm** via tvkit (CRON_FARM), news digest, weekly lesson — lihat /learn / .env.
 
 STRUKTUR ANALISIS LENGKAP (jika diminta rekomendasi/fundamental)
 1) Ringkasan
@@ -334,7 +349,7 @@ class AnalystAgent:
         return (
             f"{SYSTEM_PROMPT}\n\n"
             f"CAKUPAN DATA TERSEDIA:\n{self._coverage}\n"
-            f"MARKET_SOURCE: Stockbit Chartbit (bukan Yahoo) — "
+            f"MARKET_SOURCE: tvkit OHLCV + Stockbit fundamentals (bukan Yahoo) — "
             f"rebuild_market_from_stockbit / farm_stockbit_charts\n"
             f"FOLDER EXPORT: {self.export_dir}\n"
             f"PROJECT ROOT (list/read tools): {Path(__file__).resolve().parent.parent}\n"
@@ -928,15 +943,15 @@ class AnalystAgent:
                 f"- market digest: `{s.cron_market}` (Sen–Jum)",
                 f"- Stockbit stream farm: `{s.cron_reports}` days=`{s.cron_reports_days}` "
                 "(@StockbitReports + https://stockbit.com/Stockbit)",
-                f"- Chartbit farm: `{s.cron_farm}` tf=`{s.cron_farm_timeframes}` (Sen–Jum) "
-                "→ `https://stockbit.com/symbol/{TICKER}/chartbit`",
+                f"- Chart farm (tvkit): `{s.cron_farm}` tf=`{s.cron_farm_timeframes}` (Sen–Jum) "
+                "→ `IDX:{{TICKER}}`",
                 f"- Fundamentals farm: `{s.cron_fundamentals}` (Jumat 07:00 WIB; "
                 "semua IDX; financials, keystats, profile)",
                 f"- news digest: `{s.cron_news}` (Sen–Jum)",
                 f"- weekly lesson: `{s.cron_weekly}` (Minggu)",
                 "",
                 "Jadwal diubah lewat `.env` (`CRON_*`) lalu restart bot.",
-                "Farming Stockbit Reports + Chartbit weekday sudah aktif.",
+                "Farming Stockbit Reports weekday + chart farm (tvkit) via CRON_FARM.",
                 "Cek status cepat: `/learn`",
             ]
         elif re.search(r"reset|clear\s+history", q):
@@ -959,7 +974,7 @@ class AnalystAgent:
                 "- Baca PDF/foto, list/baca file project (tulis file perlu konfirmasi ya/tidak)",
                 "- Council 3-agent: `/council`",
                 "",
-                "**Cron otomatis:** market / Stockbit Reports / Chartbit farm / news / weekly "
+                "**Cron otomatis:** market / Stockbit Reports / chart farm (tvkit) / news / weekly "
                 "(lihat `/learn`).",
                 "**Batasan:** PDF tidak otomatis; tidak ada order/trading Stockbit.",
             ]

@@ -51,7 +51,79 @@ _META_BOT = re.compile(
     re.I,
 )
 
-_SYMBOL = re.compile(r"\b([A-Za-z]{4})\b")
+_SYMBOL = re.compile(r"\b([A-Za-z]{3,5})\b")
+_DOLLAR_SYMBOL = re.compile(r"\$([A-Za-z]{3,5})\b")
+_UNIVERSE_CACHE: set[str] | None = None
+_PSEUDO_SYMBOLS = frozenset({"IHSG", "JKSE", "COMPOSITE"})
+# Real IDX codes that are also common Indonesian/English words — only accept
+# with explicit ticker context ($SYM / cek SYM / saham SYM / …).
+_AMBIGUOUS_SYMBOLS = frozenset(
+    {
+        "BACA",
+        "AREA",
+        "CASH",
+        "BEST",
+        "CITY",
+        "GOLD",
+        "IRON",
+        "LAND",
+        "MARK",
+        "PLUS",
+        "STAR",
+        "TECH",
+        "TIME",
+        "WAVE",
+        "FIRE",
+        "BLUE",
+        "PINK",
+        "DARK",
+        "FAST",
+        "SAFE",
+        "SOLE",
+        "TOPS",
+        "WIFI",
+        "ZONE",
+        "HOME",
+        "HOPE",
+        "CARE",
+        "LIFE",
+        "EAST",
+        "WEST",
+        "WOOD",
+        "WINE",
+        "BOAT",
+        "BALL",
+        "BELL",
+        "BANK",  # also filler in "Bank Indonesia"
+        "DATA",
+        "FILM",
+        "FOOD",
+        "FUJI",
+        "GOLF",
+        "HALO",
+        "HEAL",
+        "HERO",
+        "HILL",
+        "ICON",
+        "INDO",
+        "JAVA",
+        "KING",
+        "KINO",
+        "META",
+        "MINA",
+        "NINE",
+        "PALM",
+        "PORT",
+        "PURE",
+        "ROCK",
+        "SALE",
+        "SHIP",
+        "SMSM",
+        "TELE",
+        "UNIT",
+        "YELO",
+    }
+)
 _SKIP_SYMBOLS = frozenset(
     {
         "YTD",
@@ -272,6 +344,47 @@ _SKIP_SYMBOLS = frozenset(
         "CAN",
         "MAY",
         "ALSO",
+        # Seen mis-parsed as tickers in Jul/Aug 2026 chats
+        "AKAN",
+        "KENA",
+        "COBA",
+        "MSCI",
+        "GRUP",
+        "HSC",
+        # BACA stays out of SKIP — handled as _AMBIGUOUS_SYMBOLS (real ticker)
+        "GUNA",
+        "PUNY",
+        "YANG",
+        "ATAU",
+        "KALA",
+        "KALO",
+        "NIH",
+        "DEH",
+        "SIH",
+        "KAN",
+        "YAA",
+        "YAH",
+        "GIA",
+        "BAGI",
+        "RATA",
+        "NILA",
+        "ANGK",
+        "HARGA",
+        "CLOSE",
+        "OPEN",
+        "HIGH",
+        "LOW",
+        "VOL",
+        "AVG",
+        "MIN",
+        "MAX",
+        "PCT",
+        "BPS",
+        "OJK",
+        "POJK",
+        "KI",
+        "RUPS",
+        "RUPA",
     }
 )
 
@@ -281,7 +394,9 @@ _TOPIC_KEYS = re.compile(
     r"cron|cronjob|jadwal|farming|scrape|chart\s*1h|elliott|wave|"
     r"foreign(?:\s*flow)?|net\s*foreign|backtest|pdf|gambar|foto|knowledge|belajar|"
     r"login\s*stockbit|stockbit\s*reports|folder|project|symbols_list|"
-    r"pe\s*ratio|npl|macd|digest"
+    r"pe\s*ratio|npl|macd|digest|"
+    r"siapa\s+bilang|chat|telegram|di\s+group|di\s+grup|"
+    r"free\s*float|hsc\b|sbn|usdidr|gubernur\s+bi|phk\b"
     r")\b",
     re.I,
 )
@@ -303,12 +418,65 @@ def is_meta_bot_query(text: str) -> bool:
     return True
 
 
+def _load_universe() -> set[str]:
+    """IDX Universe codes from symbols_list.txt (cached). Empty on IO failure."""
+    global _UNIVERSE_CACHE
+    if _UNIVERSE_CACHE is not None:
+        return _UNIVERSE_CACHE
+    try:
+        from agent_idx.chart_farm import load_symbols
+
+        _UNIVERSE_CACHE = set(load_symbols()) | set(_PSEUDO_SYMBOLS)
+    except Exception:  # noqa: BLE001
+        _UNIVERSE_CACHE = set(_PSEUDO_SYMBOLS)
+    return _UNIVERSE_CACHE
+
+
+def _has_ticker_context(text: str, sym: str) -> bool:
+    """True if ``sym`` appears as an intentional ticker, not a filler word."""
+    raw = text or ""
+    s = re.escape(sym)
+    patterns = (
+        rf"\${s}\b",
+        rf"\b(?:saham|emiten|ticker|kode)\s+{s}\b",
+        rf"\b(?:cek|analisis|analisa|lihat|buka|chart|farm|scrape|ringkas)\s+\$?{s}\b",
+        rf"\b{s}\b(?:\s+(?:fundamental|teknikal|chart|timeframe|keystats|profile|"
+        rf"ohlcv|harga|valuasi|pbv|per\b|free\s*float))",
+        rf"\b(?:fundamental|teknikal|chart|timeframe)\s+(?:(?:saham|emiten)\s+)?{s}\b",
+    )
+    return any(re.search(p, raw, re.I) for p in patterns)
+
+
 def extract_symbols(text: str) -> set[str]:
+    """Extract IDX Symbols from text.
+
+    Rules (anti-hallucination):
+    - ``$TICKER`` always accepted if 3–5 letters (and in Universe when known)
+    - Bare words must be in the Universe (or IHSG pseudo-symbols)
+    - Ambiguous codes that are also common words need ticker context
+    - Skip-list fillers never count
+    """
+    raw = text or ""
+    universe = _load_universe()
     found: set[str] = set()
-    for m in _SYMBOL.finditer(text or ""):
+
+    for m in _DOLLAR_SYMBOL.finditer(raw):
         sym = m.group(1).upper()
-        if sym not in _SKIP_SYMBOLS:
-            found.add(sym)
+        if sym in _SKIP_SYMBOLS:
+            continue
+        if universe and sym not in universe and sym not in _PSEUDO_SYMBOLS:
+            continue
+        found.add(sym)
+
+    for m in _SYMBOL.finditer(raw):
+        sym = m.group(1).upper()
+        if sym in found or sym in _SKIP_SYMBOLS:
+            continue
+        if universe and sym not in universe and sym not in _PSEUDO_SYMBOLS:
+            continue
+        if sym in _AMBIGUOUS_SYMBOLS and not _has_ticker_context(raw, sym):
+            continue
+        found.add(sym)
     return found
 
 
@@ -341,6 +509,14 @@ def should_drop_history(
 
     if is_meta_bot_query(q):
         return True, "meta_bot_query"
+
+    # Chat-log questions after a stock thread → don't inherit DSSA/etc.
+    if re.search(
+        r"\b(siapa\s+bilang|di\s+(?:group|grup)|cari\s+di\s+chat)\b",
+        q,
+        re.I,
+    ) and extract_symbols(_history_blob(history)):
+        return True, "chat_search_switch"
 
     # User explicitly continues prior thread.
     if _CONTINUE.search(q):

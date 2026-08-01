@@ -468,9 +468,9 @@ def get_stockbit_ohlcv(
     n: int = 40,
     refresh: bool = False,
 ) -> str:
-    """Primary backend tool helper: Stockbit Chartbit OHLCV for 5M/30M/1H/1D/1W.
+    """Primary backend tool helper: OHLCV for 5M/30M/1H/1D/1W.
 
-    Reads DuckDB/parquet. If refresh=True or TF missing, farms Chartbit first.
+    Reads DuckDB/parquet. If refresh=True or TF missing, farms via tvkit first.
     """
     from agent_idx import chart_farm
 
@@ -542,7 +542,7 @@ def get_stockbit_ohlcv(
     blocks = [
         f"get_stockbit_ohlcv symbol={sym} timeframes={','.join(tfs)} n={n}",
         (
-            f"source=Stockbit Chartbit (parquet+DuckDB) "
+            f"source=tvkit (parquet+DuckDB) "
             f"refresh={bool(refresh)} farmed={farmed}"
         ),
     ]

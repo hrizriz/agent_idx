@@ -58,16 +58,21 @@ _MARKET_HINT = re.compile(
 )
 _NEWS_HINT = re.compile(r"\b(berita|news|sentimen|headline)\b", re.I)
 _CHAT_HINT = re.compile(
-    r"\b(chat|group|grup|siapa\s+bilang|diskusi|telegram)\b",
+    r"\b("
+    r"chat|telegram|"
+    r"siapa\s+bilang|diskusi\s+(?:di\s+)?(?:group|grup|chat)|"
+    r"di\s+(?:group|grup)\b|group\s+ini|grup\s+(?:ini|chat|telegram|kita)\b"
+    r")\b",
     re.I,
 )
 _KNOWLEDGE_HINT = re.compile(
     r"\b("
     r"fundamental|valuasi|rasio|teori|kurikulum|pe\s+ratio|roe|car\s+analisis|"
     r"macd|sma\b|ema\b|npl|"
-    r"apa\s+itu\s+(?:macd|sma|ema|roe|npl|rsi|pe|pbv|der)|"
+    r"apa\s+itu\s+(?:macd|sma|ema|roe|npl|rsi|pe|pbv|der|hsc|free\s*float)|"
     r"apa\s+beda(?:nya)?\s+(?:macd|sma|ema)|"
-    r"jelaskan\s+(?:macd|sma|ema|roe|npl|rsi)"
+    r"jelaskan\s+(?:macd|sma|ema|roe|npl|rsi|hsc)|"
+    r"kategori\s+hsc|notasi\s+khusus|special\s+notation"
     r")\b",
     re.I,
 )
@@ -77,6 +82,49 @@ _KEYSTATS_HINT = re.compile(
     r"profil(?:e)?(?:\s+perusahaan|\s+emiten)?|"
     r"shareholder|pemegang\s+saham|bod\b|komisaris|direksi|"
     r"company\s+background|financials?\s+stockbit"
+    r")\b",
+    re.I,
+)
+_FUNDAMENTAL_FACT = re.compile(
+    r"\b("
+    r"free\s*float|freefloat|float\s+saham|"
+    r"market\s*cap|kapitalisasi|"
+    r"jumlah\s+saham|saham\s+beredar|listed\s+shares|outstanding|"
+    r"treasury|saham\s+tresuri|saham\s+treasury|"
+    r"\bpbv\b|\bper\b|\broe\b|harga\s+wajar|valuasi|"
+    r"\bhsc\b|notasi\s+khusus|special\s+notation|"
+    r"kepemilikan|%\s*(?:saham|kepemilikan|dari\s+saham)|"
+    r"(?:setara|value|nilai)\s+(?:dengan\s+)?(?:berapa\s+)?(?:rupiah|rp)|"
+    r"berapa\s+(?:value|nilai|rupiah)"
+    r")\b",
+    re.I,
+)
+_TECH_AND_FUND = re.compile(
+    r"\b("
+    r"teknikal\s*(?:&|dan|/)\s*fundamental|"
+    r"fundamental\s*(?:&|dan|/)\s*teknikal|"
+    r"analyze_stock|analisa(?:kan)?\s+saham|"
+    r"cek\s+(?:\$?[A-Za-z]{3,5})\s+fundamental"
+    r")\b",
+    re.I,
+)
+_MACRO_EXTERNAL = re.compile(
+    r"\b("
+    r"sbn|sun\b|yield\s+(?:sbn|sun|obligasi)|"
+    r"usd/?idr|kurs\s+(?:dolar|dollar|usd)|"
+    r"pengangguran|phk\b|kemnaker|"
+    r"gubernur\s+(?:bi|bank\s+indonesia)|bank\s+indonesia|"
+    r"the\s+fed|fomc|powell|chairman\s+(?:the\s+)?fed|"
+    r"calon\s+gubernur|kredibilitas\s+data"
+    r")\b",
+    re.I,
+)
+_CORP_OWNERSHIP = re.compile(
+    r"\b("
+    r"(?:grup|group)\s+(?:sinarmas|astra|salim|djarum|lippo|bakrie)|"
+    r"punya\s+emiten|emiten\s+apa\s+saja|"
+    r"osint|afiliasi|anak\s+usaha|holding|"
+    r"akuisisi|tender\s+offer|takeover|pengambilalihan"
     r")\b",
     re.I,
 )
@@ -409,8 +457,113 @@ def classify_intent(text: str) -> QueryPlan:
                 "stockbit_status",
                 "stockbit_open",
                 "stockbit_read",
+                "get_fundamentals",
+                "analyze_stock",
                 "get_stockbit_ohlcv",
                 "search_stockbit_reports",
+            ],
+        )
+
+    # Free float / PBV / treasury / HSC / nilai % kepemilikan → fundamentals + harga
+    if _FUNDAMENTAL_FACT.search(raw):
+        if symbols:
+            return QueryPlan(
+                intent=Intent.GENERAL,
+                focus=symbols[0],
+                symbols=symbols,
+                sources=["stockbit_browser", "pasar", "knowledge"],
+                retrieval="fundamentals_tools",
+                reason=(
+                    "fakta fundamental emiten (float/shares/valuasi/HSC) — "
+                    "WAJIB get_fundamentals/analyze_stock/scrape; GAP_DATA jika kosong"
+                ),
+                allowed_tools=[
+                    "analyze_stock",
+                    "get_fundamentals",
+                    "get_stockbit_ohlcv",
+                    "get_technicals",
+                    "stockbit_scrape",
+                    "farm_stockbit_fundamentals",
+                    "search_stockbit_reports",
+                    "search_knowledge",
+                    "search_news",
+                    "list_date_range",
+                ],
+            )
+        return QueryPlan(
+            intent=Intent.KNOWLEDGE,
+            focus=focus,
+            symbols=symbols,
+            sources=["knowledge", "berita"],
+            retrieval="keyword",
+            reason="definisi/aturan fundamental (HSC/MSCI/float) tanpa ticker — jangan pakai OHLCV",
+            allowed_tools=[
+                "search_knowledge",
+                "search_news",
+                "search_stockbit_reports",
+            ],
+        )
+
+    # Teknikal + fundamental bersama → analyze_stock, bukan knowledge teori saja
+    if _TECH_AND_FUND.search(raw) and symbols:
+        return QueryPlan(
+            intent=Intent.GENERAL,
+            focus=symbols[0],
+            symbols=symbols,
+            sources=["stockbit_browser", "pasar"],
+            retrieval="analyze_stock",
+            reason="analisis teknikal+fundamental emiten via analyze_stock",
+            allowed_tools=[
+                "analyze_stock",
+                "get_technicals",
+                "get_fundamentals",
+                "get_stockbit_ohlcv",
+                "search_stockbit_reports",
+                "search_news",
+                "list_date_range",
+            ],
+        )
+
+    # Makro/eksternal (SBN, USDIDR, PHK, Gubernur BI, Fed) — bukan parquet saham
+    if _MACRO_EXTERNAL.search(raw) and not (
+        symbols and re.search(r"\b(harga|chart|ohlc|volume|teknikal)\b", raw, re.I)
+    ):
+        return QueryPlan(
+            intent=Intent.GENERAL,
+            focus=focus,
+            symbols=symbols,
+            sources=["berita", "knowledge"],
+            retrieval="news_gap",
+            reason=(
+                "makro/eksternal di luar store OHLCV — search_news/knowledge; "
+                "angka yang tidak ada di tool = GAP_DATA (jangan mengarang)"
+            ),
+            allowed_tools=[
+                "search_news",
+                "search_knowledge",
+                "search_stockbit_reports",
+                "list_date_range",
+                "get_stock_history",
+            ],
+        )
+
+    # OSINT grup usaha / daftar emiten afiliasi / akuisisi
+    # (jangan override permintaan "berita …")
+    if _CORP_OWNERSHIP.search(raw) and not _NEWS_HINT.search(raw):
+        return QueryPlan(
+            intent=Intent.GENERAL,
+            focus=focus,
+            symbols=symbols,
+            sources=["stockbit_browser", "knowledge", "berita", "stockbit_reports"],
+            retrieval="ownership_osint",
+            reason="afiliasi/grup usaha — profile/reports/knowledge; GAP_DATA jika tidak tercatat",
+            allowed_tools=[
+                "stockbit_scrape",
+                "get_fundamentals",
+                "search_stockbit_reports",
+                "search_knowledge",
+                "search_news",
+                "search_chat_history",
             ],
         )
 

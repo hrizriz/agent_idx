@@ -395,6 +395,105 @@ def build_scenarios() -> list[Scenario]:
             )
         )
 
+    # ---- Anti-hallucination routes (Aug 2026 chat failures) ----
+    anti_halu = [
+        (
+            "H01",
+            "Emang berapa free float dssa?",
+            ["general"],
+            ["market_analysis"],
+            "fundamentals not parquet",
+        ),
+        (
+            "H02",
+            "Berapa value 5% dssa itu ya dengan last close price",
+            ["general"],
+            ["market_analysis"],
+            "pct ownership value",
+        ),
+        (
+            "H03",
+            "Kategori HSC itu gimana? Dari msci ada minimal free float?",
+            ["knowledge", "general"],
+            ["market_analysis"],
+            "HSC/MSCI theory",
+        ),
+        (
+            "H04",
+            "Dalam 1 kalimat: SBN yield hari ini, USDIDR, IHSG",
+            ["general", "news"],
+            ["market_analysis"],
+            "macro GAP path",
+        ),
+        (
+            "H05",
+            "Cek kredibilitas data PHK Kemnaker 2022-2026",
+            ["general", "news"],
+            ["market_analysis"],
+            "PHK external",
+        ),
+        (
+            "H06",
+            "Apakah $ketr grup Sinarmas?",
+            ["general"],
+            ["chat_search", "market_analysis"],
+            "ownership not chat",
+        ),
+        (
+            "H07",
+            "Progress akuisisi ketr oleh Sinarmas terakhir gimana?",
+            ["general"],
+            ["market_analysis"],
+            "akuisisi reports",
+        ),
+        (
+            "H08",
+            "Cek teknikal & fundamental GOTO dong harga wajarnya diberapa?",
+            ["general"],
+            ["knowledge", "market_analysis"],
+            "analyze_stock path",
+        ),
+        (
+            "H09",
+            "Biasanya RAJA ini avg dihargai berapa pbv?",
+            ["general"],
+            ["market_analysis"],
+            "PBV fundamentals",
+        ),
+        (
+            "H10",
+            "Bukannya data terakhir 29 juli yaa? Kok masih baca 24 juli?",
+            ["general", "bot_meta", "market_analysis"],
+            [],
+            "baca=verb not ticker BACA",
+        ),
+        (
+            "H11",
+            "Analisis coba gubernur BI yang baru? Proyeksi masa depan",
+            ["general", "news", "knowledge"],
+            ["market_analysis"],
+            "BI governor not COBA ticker",
+        ),
+        (
+            "H12",
+            "Dssa ini kena hsc dari bei kan?",
+            ["general"],
+            ["market_analysis"],
+            "HSC fact per symbol",
+        ),
+    ]
+    for sid, q, intent_in, intent_not, notes in anti_halu:
+        out.append(
+            _s(
+                sid,
+                "anti_halu",
+                q,
+                intent_in=intent_in,
+                intent_not=intent_not,
+                notes=notes,
+            )
+        )
+
     # Ensure we have at least 200; pad with generated market variants if short.
     n = 1
     while len(out) < 200:

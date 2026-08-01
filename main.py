@@ -246,10 +246,35 @@ def main(argv: list[str] | None = None) -> int:
 
     pg_p = sub.add_parser(
         "export-pg",
-        help="Export fundamentals as Postgres-ready parquet + schema.sql",
+        help="Export fundamentals/OHLCV as Postgres-ready parquet + schema.sql",
     )
     pg_p.add_argument("--out-dir", default=None, help="Default exports/postgres")
     pg_p.add_argument("--symbols", default="", help="Comma-separated; default all")
+    pg_p.add_argument(
+        "--ohlcv",
+        action="store_true",
+        help="Also merge chart bars into ohlcv.parquet (default TFs: 5M,30M,1H)",
+    )
+    pg_p.add_argument(
+        "--ohlcv-only",
+        action="store_true",
+        help="Only write ohlcv.parquet (skip fundamentals)",
+    )
+    pg_p.add_argument(
+        "--fundamentals-only",
+        action="store_true",
+        help="Only write fundamentals parquets (skip ohlcv even if --ohlcv set)",
+    )
+    pg_p.add_argument(
+        "--transform",
+        action="store_true",
+        help="Re-ingest Stockbit markdown → transforms.duckdb before fundamentals export",
+    )
+    pg_p.add_argument(
+        "--timeframes",
+        default="5M,30M,1H",
+        help="OHLCV timeframes to merge (comma-separated)",
+    )
 
     bt_p = sub.add_parser("backtest", help="Scan trading scenarios on parquet (large cap)")
     bt_p.add_argument("--min-win-rate", type=float, default=0.75)
@@ -305,14 +330,31 @@ def main(argv: list[str] | None = None) -> int:
                 print("\n".join(syms))
             return 0
         if command == "export-pg":
-            from agent_idx.pg_export import export_fundamentals
+            from agent_idx.pg_export import export_fundamentals, export_ohlcv
 
-            print(
-                export_fundamentals(
-                    out_dir=args.out_dir,
-                    symbols=[s for s in args.symbols.split(",") if s.strip()] or None,
+            do_fund = not args.ohlcv_only
+            do_ohlcv = (args.ohlcv or args.ohlcv_only) and not args.fundamentals_only
+            if args.transform and do_fund:
+                from agent_idx.transforms import run_data_transform
+
+                print(run_data_transform(scope="fundamentals"))
+                print()
+            if do_fund:
+                print(
+                    export_fundamentals(
+                        out_dir=args.out_dir,
+                        symbols=[s for s in args.symbols.split(",") if s.strip()]
+                        or None,
+                    )
                 )
-            )
+            if do_ohlcv:
+                tfs = [t.strip() for t in args.timeframes.split(",") if t.strip()]
+                print(
+                    export_ohlcv(
+                        out_dir=args.out_dir,
+                        timeframes=tfs,
+                    )
+                )
             return 0
         if command == "ask":
             return cmd_ask(store, settings, " ".join(args.question))

@@ -204,6 +204,36 @@ CREATE INDEX IF NOT EXISTS financial_statement_line_symbol_period_idx
     ON financial_statement_line (symbol, period_type, period);
 CREATE INDEX IF NOT EXISTS fundamental_metric_symbol_idx
     ON fundamental_metric (symbol);
+
+-- Chart bars (tvkit) — one row per symbol/timeframe/ts. Sourced from
+-- data/charts/{SYMBOL}/{TF}.parquet via export_ohlcv.
+CREATE TABLE IF NOT EXISTS ohlcv (
+    symbol       TEXT           NOT NULL,
+    timeframe    TEXT           NOT NULL,
+    ts           BIGINT         NOT NULL,
+    datetime     TEXT,
+    date         INTEGER,
+    open         DOUBLE PRECISION,
+    high         DOUBLE PRECISION,
+    low          DOUBLE PRECISION,
+    close        DOUBLE PRECISION,
+    volume       DOUBLE PRECISION,
+    sma_5        DOUBLE PRECISION,
+    sma_20       DOUBLE PRECISION,
+    sma_50       DOUBLE PRECISION,
+    sma_200      DOUBLE PRECISION,
+    ema_12       DOUBLE PRECISION,
+    ema_26       DOUBLE PRECISION,
+    macd         DOUBLE PRECISION,
+    macd_signal  DOUBLE PRECISION,
+    macd_hist    DOUBLE PRECISION,
+    rsi_14       DOUBLE PRECISION,
+    vol_sma_20   DOUBLE PRECISION,
+    source       TEXT,
+    PRIMARY KEY (symbol, timeframe, ts)
+);
+CREATE INDEX IF NOT EXISTS ohlcv_symbol_tf_idx
+    ON ohlcv (symbol, timeframe);
 """
 
 
@@ -347,4 +377,163 @@ def export_fundamentals(
     lines.append("- schema.sql: CREATE TABLE DDL for Postgres")
     lines.append("")
     lines.append(f"SAVED: {out / 'schema.sql'}")
+    return "\n".join(lines)
+
+
+CHARTS_DIR = Path("data") / "charts"
+
+
+def export_ohlcv(
+    *,
+    out_dir: str | Path | None = None,
+    timeframes: list[str] | None = None,
+    charts_dir: str | Path | None = None,
+) -> str:
+    """Merge ``data/charts/{SYM}/{TF}.parquet`` into one Postgres-ready file.
+
+    Default timeframes: ``5M``, ``30M``, ``1H``. Writes
+    ``exports/postgres/ohlcv.parquet`` (+ refreshes ``schema.sql``).
+    """
+    out = Path(out_dir) if out_dir else DEFAULT_OUT
+    out.mkdir(parents=True, exist_ok=True)
+    root = Path(charts_dir) if charts_dir else CHARTS_DIR
+    tfs = [
+        t.strip().upper()
+        for t in (timeframes or ["5M", "30M", "1H"])
+        if str(t).strip()
+    ]
+    if not tfs:
+        return "export ohlcv: no timeframes given"
+
+    paths: list[Path] = []
+    for tf in tfs:
+        paths.extend(sorted(root.glob(f"*/{tf}.parquet")))
+    # Skip _meta / non-symbol dirs already (glob is SYM/TF.parquet)
+    paths = [p for p in paths if p.parent.name != "_meta" and p.is_file()]
+    if not paths:
+        return (
+            f"export ohlcv: 0 parquet files under {root} for "
+            f"timeframes={','.join(tfs)}"
+        )
+
+    dest = out / "ohlcv.parquet"
+    con = duckdb.connect()
+    try:
+        con.execute("CREATE OR REPLACE TABLE ohlcv_export (symbol VARCHAR)")
+        con.execute("DELETE FROM ohlcv_export")
+        # Build empty typed table from first readable file.
+        seed = paths[0]
+        con.execute(
+            f"""
+            CREATE OR REPLACE TABLE ohlcv_export AS
+            SELECT * FROM read_parquet('{seed.as_posix()}') WHERE 1=0
+            """
+        )
+        # Drop extras we don't want in the Postgres handoff if present.
+        have0 = {r[0].lower() for r in con.execute("DESCRIBE ohlcv_export").fetchall()}
+        if "updated_at" in have0:
+            con.execute("ALTER TABLE ohlcv_export DROP COLUMN updated_at")
+        if "filename" in have0:
+            con.execute("ALTER TABLE ohlcv_export DROP COLUMN filename")
+
+        loaded = 0
+        skipped: list[str] = []
+        # Insert per file — avoids giant SQL lists and mid-farm race on one bad read.
+        for p in paths:
+            try:
+                con.execute(
+                    f"""
+                    INSERT INTO ohlcv_export BY NAME
+                    SELECT * FROM read_parquet('{p.as_posix()}')
+                    WHERE symbol IS NOT NULL AND timeframe IS NOT NULL AND ts IS NOT NULL
+                    """
+                )
+                loaded += 1
+            except Exception as exc:  # noqa: BLE001
+                skipped.append(f"{p.parent.name}/{p.name}: {type(exc).__name__}")
+                logger.warning("skip %s: %s", p, exc)
+
+        have = {r[0].lower() for r in con.execute("DESCRIBE ohlcv_export").fetchall()}
+
+        def col_expr(name: str, cast: str) -> str:
+            if name.lower() not in have:
+                return f"CAST(NULL AS {cast}) AS {name}"
+            return f"CAST({name} AS {cast}) AS {name}"
+
+        select_parts = [
+            "UPPER(CAST(symbol AS VARCHAR)) AS symbol",
+            "UPPER(CAST(timeframe AS VARCHAR)) AS timeframe",
+            "CAST(ts AS BIGINT) AS ts",
+            col_expr("datetime", "VARCHAR"),
+            col_expr("date", "INTEGER"),
+            col_expr("open", "DOUBLE"),
+            col_expr("high", "DOUBLE"),
+            col_expr("low", "DOUBLE"),
+            col_expr("close", "DOUBLE"),
+            col_expr("volume", "DOUBLE"),
+            col_expr("sma_5", "DOUBLE"),
+            col_expr("sma_20", "DOUBLE"),
+            col_expr("sma_50", "DOUBLE"),
+            col_expr("sma_200", "DOUBLE"),
+            col_expr("ema_12", "DOUBLE"),
+            col_expr("ema_26", "DOUBLE"),
+            col_expr("macd", "DOUBLE"),
+            col_expr("macd_signal", "DOUBLE"),
+            col_expr("macd_hist", "DOUBLE"),
+            col_expr("rsi_14", "DOUBLE"),
+            col_expr("vol_sma_20", "DOUBLE"),
+            col_expr("source", "VARCHAR"),
+        ]
+        select_sql = ",\n                        ".join(select_parts)
+        con.execute(
+            f"""
+            COPY (
+                SELECT * EXCLUDE (rn) FROM (
+                    SELECT
+                        {select_sql},
+                        ROW_NUMBER() OVER (
+                            PARTITION BY
+                                UPPER(CAST(symbol AS VARCHAR)),
+                                UPPER(CAST(timeframe AS VARCHAR)),
+                                CAST(ts AS BIGINT)
+                            ORDER BY symbol
+                        ) AS rn
+                    FROM ohlcv_export
+                ) WHERE rn = 1
+                ORDER BY symbol, timeframe, ts
+            ) TO '{dest.as_posix()}' (FORMAT PARQUET)
+            """
+        )
+        stats = con.execute(
+            f"""
+            SELECT COUNT(*) AS n,
+                   COUNT(DISTINCT symbol) AS syms,
+                   COUNT(DISTINCT timeframe) AS tfs
+            FROM read_parquet('{dest.as_posix()}')
+            """
+        ).fetchone()
+        by_tf = con.execute(
+            f"""
+            SELECT timeframe, COUNT(*) AS n, COUNT(DISTINCT symbol) AS syms
+            FROM read_parquet('{dest.as_posix()}')
+            GROUP BY 1 ORDER BY 1
+            """
+        ).fetchall()
+    finally:
+        con.close()
+
+    (out / "schema.sql").write_text(SCHEMA_SQL, encoding="utf-8")
+    n, syms, n_tf = stats or (0, 0, 0)
+    lines = [
+        f"export ohlcv -> {out}",
+        f"files_in={len(paths)} loaded={loaded} skipped={len(skipped)} "
+        f"timeframes={','.join(tfs)}",
+        f"- ohlcv.parquet: {n} rows symbols={syms} timeframes={n_tf}",
+    ]
+    for tf, n_rows, n_syms in by_tf:
+        lines.append(f"  · {tf}: {n_rows} rows / {n_syms} symbols")
+    if skipped:
+        lines.append(f"- skipped sample: {'; '.join(skipped[:5])}")
+    lines.append("- schema.sql: CREATE TABLE DDL for Postgres (incl. ohlcv)")
+    lines.append(f"SAVED: {dest}")
     return "\n".join(lines)

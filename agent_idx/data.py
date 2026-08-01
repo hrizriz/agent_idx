@@ -53,13 +53,35 @@ def _to_yyyymmdd(value: str | int) -> int:
 
 
 def _market_source() -> str:
-    """stockbit (default) | yahoo | all — which daily_stock_summary_*.parquet to load."""
-    raw = (os.getenv("MARKET_SOURCE") or "stockbit").strip().lower()
+    """Which daily_stock_summary_*.parquet set to load.
+
+    - ``idx`` / ``drive`` / ``bei`` — Drive Ringkasan Saham day files + tvkit gap
+      (preferred: has foreign_buy/sell).
+    - ``stockbit`` — Stockbit/tvkit rebuild (`*_stockbit_*`); falls back to others.
+    - ``yahoo`` / ``yf`` — Yahoo bootstrap only.
+    - ``all`` — every matching file (may duplicate symbol+date; prefer idx).
+    """
+    raw = (os.getenv("MARKET_SOURCE") or "idx").strip().lower()
     if raw in {"yahoo", "yf", "yfinance"}:
         return "yahoo"
     if raw in {"all", "both", "*"}:
         return "all"
-    return "stockbit"
+    if raw in {"idx", "drive", "bei", "ringkasan"}:
+        return "idx"
+    if raw in {"stockbit", "chartbit", "tvkit"}:
+        return "stockbit"
+    return "idx"
+
+
+def _is_drive_day_file(name: str) -> bool:
+    n = name.lower()
+    if "_stockbit_" in n or "_yf_" in n or "_tvkit_" in n:
+        return False
+    return bool(re.match(r"daily_stock_summary_\d{8}\.parquet$", n))
+
+
+def _is_tvkit_gap_file(name: str) -> bool:
+    return "_tvkit_" in name.lower()
 
 
 class StockDataStore:
@@ -76,12 +98,27 @@ class StockDataStore:
             return []
         all_files = sorted(self.parquet_dir.glob("daily_stock_summary_*.parquet"))
         source = _market_source()
+        drive = [p for p in all_files if _is_drive_day_file(p.name)]
+        tvkit_gap = [p for p in all_files if _is_tvkit_gap_file(p.name)]
         stockbit = [p for p in all_files if "_stockbit_" in p.name.lower()]
-        yahoo = [p for p in all_files if "_stockbit_" not in p.name.lower()]
+        yahoo = [
+            p
+            for p in all_files
+            if "_stockbit_" not in p.name.lower()
+            and not _is_drive_day_file(p.name)
+            and not _is_tvkit_gap_file(p.name)
+        ]
+        if source == "idx":
+            picked = drive + tvkit_gap
+            if picked:
+                return picked
+            # Fallback chain before first Drive sync.
+            return stockbit or yahoo or all_files
         if source == "stockbit":
             if stockbit:
                 return stockbit
-            # Fallback so bot still boots before first Stockbit rebuild.
+            if drive or tvkit_gap:
+                return drive + tvkit_gap
             return yahoo or all_files
         if source == "yahoo":
             return yahoo or all_files
@@ -100,18 +137,44 @@ class StockDataStore:
 
         listed = ", ".join("'" + p.as_posix().replace("'", "''") + "'" for p in files)
         src = _market_source()
-        # Normalize date to INTEGER YYYYMMDD (some files store it as VARCHAR).
+        # Normalize date; prefer Drive (Ringkasan) over tvkit gap on duplicate keys.
         self._con.execute(
             f"""
             CREATE OR REPLACE VIEW daily_stock AS
-            SELECT
-                * EXCLUDE (date),
-                CAST(replace(CAST(date AS VARCHAR), '-', '') AS INTEGER) AS date
-            FROM read_parquet([{listed}], union_by_name=true)
+            SELECT * EXCLUDE (rn, _prio) FROM (
+                SELECT
+                    * EXCLUDE (date),
+                    CAST(replace(CAST(date AS VARCHAR), '-', '') AS INTEGER) AS date,
+                    CASE
+                        WHEN lower(CAST(upload_file AS VARCHAR)) LIKE '%ringkasan%' THEN 0
+                        WHEN lower(CAST(upload_file AS VARCHAR)) LIKE '%tvkit%' THEN 2
+                        WHEN lower(CAST(upload_file AS VARCHAR)) LIKE '%stockbit%' THEN 1
+                        ELSE 3
+                    END AS _prio,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY
+                            UPPER(CAST(symbol AS VARCHAR)),
+                            CAST(replace(CAST(date AS VARCHAR), '-', '') AS INTEGER)
+                        ORDER BY
+                            CASE
+                                WHEN lower(CAST(upload_file AS VARCHAR)) LIKE '%ringkasan%' THEN 0
+                                WHEN lower(CAST(upload_file AS VARCHAR)) LIKE '%stockbit%' THEN 1
+                                WHEN lower(CAST(upload_file AS VARCHAR)) LIKE '%tvkit%' THEN 2
+                                ELSE 3
+                            END
+                    ) AS rn
+                FROM read_parquet([{listed}], union_by_name=true)
+            ) WHERE rn = 1
             """
         )
         self._active_files = files
-        self._active_source = src if (src != "stockbit" or any("_stockbit_" in p.name.lower() for p in files)) else "yahoo_fallback"
+        if src == "idx" and any(_is_drive_day_file(p.name) for p in files):
+            self._active_source = "idx_drive+tvkit_gap"
+        elif src == "stockbit" and any("_stockbit_" in p.name.lower() for p in files):
+            self._active_source = "stockbit"
+        else:
+            self._active_source = src
+
 
     def close(self) -> None:
         self._con.close()
@@ -123,8 +186,8 @@ class StockDataStore:
             f"Table: daily_stock (MARKET_SOURCE={src})",
             f"files={[p.name for p in files]}",
             "date is INTEGER YYYYMMDD - filter with e.g. date BETWEEN 20220101 AND 20221231",
-            "Preferred source: Stockbit Chartbit (daily_stock_summary_stockbit_*.parquet).",
-            "Yahoo/yfinance files are ignored when MARKET_SOURCE=stockbit and Stockbit panel exists.",
+            "Preferred source: IDX Drive Ringkasan Saham + tvkit gap (MARKET_SOURCE=idx).",
+            "Yahoo/yfinance ignored when idx/stockbit panels exist.",
             "",
             "Columns:",
         ]

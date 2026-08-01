@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import pytest
 
-from agent_idx import browser_stockbit, stockbit_reports
+from agent_idx import browser_stockbit, fund_farm, stockbit_reports
 from agent_idx.ma_squeeze_study import _add_ma_features
 
 
@@ -79,3 +83,78 @@ def test_closed_browser_is_marked_dead_without_cleanup(monkeypatch) -> None:
 
     assert fake.marked
     assert not fake.closed
+
+
+def test_fund_farm_skips_recent_complete_sidecar(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(fund_farm, "FUND_DIR", tmp_path)
+    (tmp_path / "BBCA.json").write_text(
+        json.dumps(
+            {
+                "symbol": "BBCA",
+                "scraped_at": "2026-07-31T00:30:00+07:00",
+                "sections": ["overview", "keystats", "financials", "profile"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = datetime(2026, 7, 31, 8, 0, tzinfo=ZoneInfo("Asia/Jakarta"))
+
+    stale, fresh = fund_farm.filter_fresh_symbols(
+        ["BBCA", "BMRI"],
+        ["keystats", "financials", "profile"],
+        fresh_days=7,
+        now=now,
+    )
+
+    assert stale == ["BMRI"]
+    assert fresh == ["BBCA"]
+
+
+def test_fund_farm_does_not_skip_incomplete_sections(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(fund_farm, "FUND_DIR", tmp_path)
+    (tmp_path / "BBCA.json").write_text(
+        json.dumps(
+            {
+                "symbol": "BBCA",
+                "scraped_at": "2026-07-31T00:30:00+07:00",
+                "sections": ["keystats", "profile"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = datetime(2026, 7, 31, 8, 0, tzinfo=ZoneInfo("Asia/Jakarta"))
+
+    stale, fresh = fund_farm.filter_fresh_symbols(
+        ["BBCA"],
+        ["keystats", "financials", "profile"],
+        fresh_days=7,
+        now=now,
+    )
+
+    assert stale == ["BBCA"]
+    assert fresh == []
+
+
+def test_fund_farm_rescrapes_at_seven_calendar_days(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(fund_farm, "FUND_DIR", tmp_path)
+    (tmp_path / "BBCA.json").write_text(
+        json.dumps(
+            {
+                "symbol": "BBCA",
+                "scraped_at": "2026-07-24T09:00:00+07:00",
+                "sections": ["keystats", "financials", "profile"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = datetime(2026, 7, 31, 7, 0, tzinfo=ZoneInfo("Asia/Jakarta"))
+
+    stale, fresh = fund_farm.filter_fresh_symbols(
+        ["BBCA"],
+        ["keystats", "financials", "profile"],
+        fresh_days=7,
+        now=now,
+    )
+
+    assert stale == ["BBCA"]
+    assert fresh == []

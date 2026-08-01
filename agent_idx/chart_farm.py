@@ -1,14 +1,18 @@
-"""Farm Stockbit Chartbit OHLCV (1H / 1D / 1W) into parquet + indicators.
+"""Farm IDX OHLCV via tvkit (TradingView) into parquet + indicators.
 
 Shared by scripts/farm_stockbit_charts.py and the agent tool `farm_stockbit_charts`.
 Bulk runs are staged and require explicit user confirmation before they start.
+
+Bars are written with ``source = 'tvkit'``. Project Timeframe codes (``1M`` =
+1 minute) are mapped to tvkit intervals; tvkit's own ``1M`` means monthly and
+must never be passed through unchanged.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -27,6 +31,29 @@ DEFAULT_TIMEFRAMES = ["1H", "1D", "1W"]
 SUPPORTED_TIMEFRAMES = frozenset(
     {"1M", "5M", "15M", "30M", "1H", "4H", "1D", "1W"}
 )
+# Project TF → tvkit interval string. Critical: project 1M is 1-minute ("1"),
+# not tvkit's monthly "1M".
+TVKIT_INTERVAL = {
+    "1M": "1",
+    "5M": "5",
+    "15M": "15",
+    "30M": "30",
+    "1H": "1H",
+    "4H": "4H",
+    "1D": "1D",
+    "1W": "1W",
+}
+DEFAULT_BARS_COUNT = {
+    "1M": 5000,
+    "5M": 5000,
+    "15M": 5000,
+    "30M": 5000,
+    "1H": 5000,
+    "4H": 3000,
+    "1D": 5000,
+    "1W": 800,
+}
+BAR_SOURCE = "tvkit"
 # More than this many symbols is a "bulk" job and needs user confirmation.
 BULK_THRESHOLD = 3
 MAX_SYMBOLS_PER_JOB = 1000
@@ -175,7 +202,7 @@ def bars_to_df(symbol: str, timeframe: str, bars: list[dict]) -> pd.DataFrame:
                 "low": b.get("low"),
                 "close": b.get("close"),
                 "volume": b.get("volume") or 0,
-                "source": "stockbit_chartbit",
+                "source": BAR_SOURCE,
             }
         )
     df = pd.DataFrame(rows)
@@ -203,7 +230,7 @@ def save_tf_parquet(symbol: str, timeframe: str, df: pd.DataFrame) -> Path:
 
 
 def format_latest_bars(symbol: str, timeframe: str, *, n: int = 12) -> str:
-    """Human-readable latest OHLCV rows from farmed Chartbit parquet."""
+    """Human-readable latest OHLCV rows from farmed parquet."""
     sym = (symbol or "").strip().upper()
     tf = (timeframe or "1H").strip().upper()
     path = CHARTS_DIR / sym / f"{tf}.parquet"
@@ -232,9 +259,15 @@ def format_latest_bars(symbol: str, timeframe: str, *, n: int = 12) -> str:
         except Exception:  # noqa: BLE001
             pass
     tail = work.tail(n)
+    src = ""
+    if "source" in work.columns and len(work):
+        try:
+            src = str(work["source"].iloc[-1])
+        except Exception:  # noqa: BLE001
+            src = ""
     lines = [
-        f"Chartbit {sym} timeframe {tf} — {len(df)} bar tersimpan, {n} terakhir:",
-        f"sumber: {path.as_posix()}",
+        f"Chart {sym} timeframe {tf} — {len(df)} bar tersimpan, {n} terakhir:",
+        f"sumber: {path.as_posix()}" + (f" ({src})" if src else ""),
         "",
     ]
     cols = [c for c in ("open", "high", "low", "close", "volume") if c in tail.columns]
@@ -319,7 +352,7 @@ def quick_chart_analysis(symbol: str, timeframe: str, *, lookback: int = 40) -> 
         f"• Arah {lookback} bar: {chg:+.4g} ({pct:+.2f}%) → {bias}\n"
         f"• Support kasar ≈ {lo:g}, resistance kasar ≈ {hi:g}\n"
         + (f"• {vol_note}\n" if vol_note else "")
-        + "Catatan: bukan saran investasi; verifikasi di Chartbit."
+        + "Catatan: bukan saran investasi; verifikasi di sumber chart."
     )
 
 
@@ -403,7 +436,7 @@ def rebuild_stockbit_daily_summary(
                     0.0 AS non_regular_value,
                     0.0 AS non_regular_frequency,
                     CAST(replace(CAST(date AS VARCHAR), '-', '') AS INTEGER) AS date,
-                    'stockbit_chartbit_1d' AS upload_file
+                    'tvkit_1d' AS upload_file
                 FROM read_parquet([{listed}], union_by_name=true)
                 WHERE close IS NOT NULL
                 """
@@ -439,7 +472,7 @@ def rebuild_stockbit_daily_summary(
                     0.0 AS non_regular_value,
                     0.0 AS non_regular_frequency,
                     CAST(replace(CAST(date AS VARCHAR), '-', '') AS INTEGER) AS date,
-                    'stockbit_chartbit_1h' AS upload_file
+                    'tvkit_1h' AS upload_file
                 FROM read_parquet([{listed}], union_by_name=true)
                 WHERE close IS NOT NULL AND date IS NOT NULL
                 GROUP BY 1, 2, date
@@ -456,7 +489,7 @@ def rebuild_stockbit_daily_summary(
                     *,
                     ROW_NUMBER() OVER (
                         PARTITION BY symbol, date
-                        ORDER BY CASE WHEN upload_file = 'stockbit_chartbit_1d' THEN 0 ELSE 1 END
+                        ORDER BY CASE WHEN upload_file = 'tvkit_1d' THEN 0 ELSE 1 END
                     ) AS rn
                 FROM ({union})
             ) WHERE rn = 1
@@ -502,11 +535,80 @@ def rebuild_stockbit_daily_summary(
         con.close()
 
 
-def _browser(headless: bool | None = None):
-    """Reuse the agent's persistent Stockbit profile/session."""
-    from agent_idx.tools import _stockbit_browser
+def tvkit_exchange_symbol(symbol: str) -> str:
+    """Map project Symbol / IHSG pseudo-symbol to a tvkit exchange:symbol."""
+    sym = (symbol or "").strip().upper()
+    if sym in {"IHSG", "COMPOSITE", "JKSE"}:
+        return "INDEX:JKSE"
+    return f"IDX:{sym}"
 
-    return _stockbit_browser(headless)
+
+def _bar_to_dict(bar) -> dict:
+    return {
+        "ts": int(bar.timestamp),
+        "open": float(bar.open),
+        "high": float(bar.high),
+        "low": float(bar.low),
+        "close": float(bar.close),
+        "volume": float(bar.volume or 0),
+    }
+
+
+async def _fetch_one_async(client, symbol: str, timeframes: list[str]) -> dict:
+    """Pull OHLCV for one Symbol via an open tvkit OHLCV client."""
+    sym = (symbol or "").strip().upper()
+    if not sym or not sym.replace(".", "").isalnum() or len(sym) > 8:
+        return {
+            "symbol": sym,
+            "timeframes": {},
+            "intercepted_urls": [],
+            "unauthorized_urls": [],
+            "error": "invalid symbol",
+        }
+
+    tv_sym = tvkit_exchange_symbol(sym)
+    result_tfs: dict = {}
+    fetch_errors: list[str] = []
+
+    for tf in timeframes:
+        interval = TVKIT_INTERVAL.get(tf)
+        if not interval:
+            result_tfs[tf] = {"bars": [], "source_urls": [], "error": "unsupported tf"}
+            fetch_errors.append(f"{tf}:unsupported")
+            continue
+        bars_count = DEFAULT_BARS_COUNT.get(tf, 3000)
+        source_url = f"tvkit://{tv_sym}/{interval}"
+        try:
+            bars = await client.get_historical_ohlcv(
+                exchange_symbol=tv_sym,
+                interval=interval,
+                bars_count=bars_count,
+            )
+            result_tfs[tf] = {
+                "bars": [_bar_to_dict(b) for b in (bars or [])],
+                "source_urls": [source_url],
+            }
+            if not bars:
+                fetch_errors.append(f"{tf}:empty")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tvkit fetch failed %s %s: %s", sym, tf, exc)
+            result_tfs[tf] = {
+                "bars": [],
+                "source_urls": [source_url],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            fetch_errors.append(f"{tf}:{type(exc).__name__}")
+
+    any_bars = any((p.get("bars") or []) for p in result_tfs.values())
+    err = None if any_bars else ("NO_OHLCV" if fetch_errors else "NO_OHLCV")
+    return {
+        "symbol": sym,
+        "timeframes": result_tfs,
+        "intercepted_urls": [f"tvkit://{tv_sym}"],
+        "unauthorized_urls": [],
+        "error": err,
+        "fetch_errors": fetch_errors,
+    }
 
 
 def farm_one(
@@ -516,17 +618,17 @@ def farm_one(
     headless: bool | None = None,
     wait_login_sec: int = 0,
 ) -> dict:
-    from agent_idx.browser_stockbit import run_sync
+    """Farm one Symbol via tvkit. ``headless`` / ``wait_login_sec`` kept for callers."""
+    del headless, wait_login_sec  # unused — no browser for chart farm
+    tfs = [t.strip().upper() for t in timeframes if str(t).strip()]
 
-    def _run():
-        browser = _browser(headless)
-        # Always ensure a live page — ready=False after TargetClosed / kill.
-        browser.start()
-        return browser.scrape_chart_candles(
-            symbol, timeframes, wait_login_sec=wait_login_sec
-        )
+    async def _run():
+        from tvkit.api.chart.ohlcv import OHLCV
 
-    return run_sync(_run)
+        async with OHLCV() as client:
+            return await _fetch_one_async(client, symbol, tfs)
+
+    return asyncio.run(_run())
 
 
 def run_farm(
@@ -535,12 +637,11 @@ def run_farm(
     *,
     headless: bool | None = None,
     sync_daily: bool = False,
-    sleep_sec: float = 1.0,
+    sleep_sec: float = 0.25,
     on_progress: ProgressFn | None = None,
 ) -> str:
-    """Farm OHLCV for each symbol and write parquet. Returns a text summary."""
-    from agent_idx.browser_stockbit import NEED_CREDENTIALS, NEED_OTP
-
+    """Farm OHLCV for each symbol via tvkit and write parquet. Returns a text summary."""
+    del headless  # unused — no browser for chart farm
     tfs = [t.strip().upper() for t in (timeframes or DEFAULT_TIMEFRAMES) if t.strip()]
     if not symbols:
         return "ERROR: tidak ada simbol untuk di-farm."
@@ -559,107 +660,77 @@ def run_farm(
     ok_symbols: list[str] = []
     failed: list[str] = []
     lines: list[str] = []
-    stopped_reason = ""
     total = len(symbols)
-    progress(f"Mulai farming {total} simbol x {tfs}")
+    progress(f"Mulai farming tvkit {total} simbol x {tfs}")
 
-    for i, sym in enumerate(symbols, start=1):
-        try:
-            result = farm_one(
-                sym,
-                tfs,
-                headless=headless,
-                wait_login_sec=120 if i == 1 else 0,
-            )
-        except Exception as exc:  # noqa: BLE001
-            from agent_idx.browser_stockbit import _is_browser_closed_error
+    async def _run_all() -> None:
+        from tvkit.api.chart.ohlcv import OHLCV
 
-            logger.exception("Farm failed for %s", sym)
-            failed.append(sym)
-            lines.append(f"{sym}: GAGAL ({exc})")
-            if _is_browser_closed_error(exc):
-                stopped_reason = (
-                    "BROWSER_CLOSED\n"
-                    f"Berhenti di {sym}: Chromium/Playwright tertutup.\n"
-                    "Buka lagi /stockbit (jangan tutup jendela), lalu lanjutkan farm."
+        async with OHLCV() as client:
+            for i, sym in enumerate(symbols, start=1):
+                try:
+                    result = await _fetch_one_async(client, sym, tfs)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Farm failed for %s", sym)
+                    failed.append(sym)
+                    lines.append(f"{sym}: GAGAL ({exc})")
+                    continue
+
+                err = result.get("error")
+                meta = {
+                    "symbol": sym,
+                    "source": BAR_SOURCE,
+                    "error": err,
+                    "intercepted_urls": result.get("intercepted_urls") or [],
+                    "unauthorized_urls": result.get("unauthorized_urls") or [],
+                    "fetch_errors": result.get("fetch_errors") or [],
+                    "timeframes": {},
+                }
+                counts: list[str] = []
+                any_bars = False
+                for tf, payload in (result.get("timeframes") or {}).items():
+                    bars = payload.get("bars") or []
+                    meta["timeframes"][tf] = {
+                        "n": len(bars),
+                        "source_urls": payload.get("source_urls") or [],
+                        "error": payload.get("error"),
+                    }
+                    if not bars:
+                        counts.append(f"{tf}=0")
+                        continue
+                    df = bars_to_df(sym, tf, bars)
+                    save_tf_parquet(sym, tf, df)
+                    counts.append(f"{tf}={len(df)}")
+                    any_bars = True
+
+                (meta_dir / f"{sym}.json").write_text(
+                    json.dumps(meta, indent=2), encoding="utf-8"
                 )
-                # Do not close/recreate the shared Browser session as recovery.
-                for rest in symbols[i:]:
-                    failed.append(rest)
-                    lines.append(f"{rest}: SKIP (browser closed)")
-                break
-            continue
 
-        err = result.get("error")
-        if err in {NEED_CREDENTIALS, NEED_OTP}:
-            stopped_reason = (
-                f"{err}\n"
-                f"Berhenti di {sym}: Chartbit butuh login Stockbit ulang "
-                "(sesi expired / API 401 / chart kosong).\n"
-                "Kirim /stockbit di Telegram, selesaikan OTP, lalu ulangi permintaan chart."
-            )
-            failed.append(sym)
-            lines.append(f"{sym}: GAGAL login ({err})")
-            break
-        if err == "CHARTBIT_BLANK_WHILE_LOGGED_IN":
-            stopped_reason = (
-                f"{err}\n"
-                f"Berhenti di {sym}: login aktif tetapi Chartbit kosong (sering di headless).\n"
-                "Set STOCKBIT_HEADLESS=false di .env, restart bot, /stockbit, lalu coba lagi."
-            )
-            failed.append(sym)
-            lines.append(f"{sym}: GAGAL Chartbit blank (logged in)")
-            break
+                if any_bars:
+                    ok_symbols.append(sym)
+                    lines.append(f"{sym}: OK ({', '.join(counts)})")
+                else:
+                    failed.append(sym)
+                    hint = "tvkit kosong / symbol tidak ada di TradingView"
+                    if result.get("fetch_errors"):
+                        hint = ", ".join(result["fetch_errors"][:4])
+                    lines.append(f"{sym}: 0 bars ({hint})")
 
-        meta = {
-            "symbol": sym,
-            "error": err,
-            "intercepted_urls": result.get("intercepted_urls") or [],
-            "unauthorized_urls": result.get("unauthorized_urls") or [],
-            "timeframes": {},
-        }
-        counts: list[str] = []
-        any_bars = False
-        for tf, payload in (result.get("timeframes") or {}).items():
-            bars = payload.get("bars") or []
-            meta["timeframes"][tf] = {
-                "n": len(bars),
-                "source_urls": payload.get("source_urls") or [],
-            }
-            if not bars:
-                counts.append(f"{tf}=0")
-                continue
-            df = bars_to_df(sym, tf, bars)
-            save_tf_parquet(sym, tf, df)
-            counts.append(f"{tf}={len(df)}")
-            any_bars = True
+                if i % 5 == 0 or i == total:
+                    progress(
+                        f"{i}/{total} selesai — OK={len(ok_symbols)} gagal={len(failed)}"
+                    )
+                if sleep_sec > 0:
+                    await asyncio.sleep(sleep_sec)
 
-        (meta_dir / f"{sym}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-        if any_bars:
-            ok_symbols.append(sym)
-            lines.append(f"{sym}: OK ({', '.join(counts)})")
-        else:
-            failed.append(sym)
-            unauth = result.get("unauthorized_urls") or []
-            hint = "cek TF / interceptor"
-            if err == "NO_OHLCV_INTERCEPTED":
-                hint = "tidak ada OHLCV di network (cek TF / anti-bot)"
-            if unauth:
-                hint = "API 401/403 — kemungkinan sesi Stockbit expired (/stockbit)"
-            lines.append(f"{sym}: 0 bars ({hint})")
-
-        if i % 5 == 0 or i == total:
-            progress(f"{i}/{total} selesai — OK={len(ok_symbols)} gagal={len(failed)}")
-        time.sleep(max(0.0, sleep_sec))
+    asyncio.run(_run_all())
 
     summary = [
         f"Farming selesai: OK={len(ok_symbols)} gagal={len(failed)} dari {total} simbol",
-        f"timeframe={','.join(tfs)}",
+        f"source={BAR_SOURCE} timeframe={','.join(tfs)}",
         f"output={CHARTS_DIR.relative_to(ROOT).as_posix()}/{{SYMBOL}}/{{TF}}.parquet",
     ]
-    if stopped_reason:
-        summary.append(stopped_reason)
     summary.extend(lines[:40])
     if len(lines) > 40:
         summary.append(f"... (+{len(lines) - 40} simbol lagi)")
@@ -667,7 +738,7 @@ def run_farm(
     if sync_daily and ok_symbols:
         out = rebuild_stockbit_daily_summary()
         if out:
-            summary.append(f"Sync Stockbit daily -> {out.relative_to(ROOT).as_posix()}")
+            summary.append(f"Sync daily panel -> {out.relative_to(ROOT).as_posix()}")
 
     return "\n".join(summary)
 
@@ -686,7 +757,8 @@ def stage_farm_job(
     *,
     sync_daily: bool = False,
 ) -> str:
-    est_min = max(1, round(len(symbols) * len(timeframes) * 12 / 60))
+    # ~1.5s per symbol×TF with tvkit (vs ~12s Chartbit scrape).
+    est_min = max(1, round(len(symbols) * len(timeframes) * 1.5 / 60))
     job = {
         "symbols": symbols,
         "timeframes": timeframes,
@@ -698,7 +770,7 @@ def stage_farm_job(
     return (
         "STAGED (menunggu konfirmasi user)\n"
         f"job=farm_stockbit_charts simbol={len(symbols)} timeframe={','.join(timeframes)}\n"
-        f"sync_daily={sync_daily} estimasi={est_min} menit\n"
+        f"source={BAR_SOURCE} sync_daily={sync_daily} estimasi={est_min} menit\n"
         f"daftar: {preview}\n"
         "CATATAN: farming BELUM jalan. User harus menyetujui (ya/tidak) di Telegram."
     )
@@ -719,7 +791,7 @@ def describe_pending_job(chat_key: int) -> str:
     symbols = job["symbols"]
     preview = ", ".join(symbols[:20]) + ("..." if len(symbols) > 20 else "")
     return (
-        "Job farming chart Stockbit menunggu konfirmasi:\n"
+        "Job farming chart (tvkit) menunggu konfirmasi:\n"
         f"• simbol: {len(symbols)} ({preview})\n"
         f"• timeframe: {', '.join(job['timeframes'])}\n"
         f"• sync ke parquet harian: {job['sync_daily']}\n"

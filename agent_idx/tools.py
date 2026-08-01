@@ -596,6 +596,8 @@ EXTRA_TOOLS: list[dict[str, Any]] = [
                 "sidecar JSON ke data/fundamentals/. "
                 "Tanpa symbols = universe data/symbols_list.txt. "
                 "Job >3 emiten di-stage (konfirmasi ya/tidak). "
+                "Default skip emiten yang sections-nya lengkap dan di-scrape <7 hari; "
+                "pakai force=true untuk scrape ulang. "
                 "Pakai limit/offset untuk batch kecil (disarankan 10–30/hari). "
                 "Pakai tier='top' untuk 200 emiten terbesar, tier='rest' untuk sisanya."
             ),
@@ -630,6 +632,17 @@ EXTRA_TOOLS: list[dict[str, Any]] = [
                         "type": "integer",
                         "description": "Lewati N emiten pertama (resume batch)",
                     },
+                    "skip_fresh_days": {
+                        "type": "integer",
+                        "description": (
+                            "Skip emiten dengan Sidecar lengkap yang lebih muda dari N "
+                            "hari kalender WIB (default 7)."
+                        ),
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "true = abaikan freshness dan scrape ulang",
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -640,7 +653,7 @@ EXTRA_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "farm_stockbit_charts",
             "description": (
-                "Scrape/farm data chart OHLCV dari Stockbit Chartbit per timeframe "
+                "Farm data chart OHLCV via tvkit (TradingView) per timeframe "
                 "(1M/5M/15M/30M/1H/4H/1D/1W) lalu simpan ke parquet + DuckDB "
                 "(data/charts.duckdb) + indikator (SMA/EMA/MACD/RSI). "
                 "INI BISA DILAKUKAN — jangan menolak permintaan farming chart. "
@@ -688,10 +701,10 @@ EXTRA_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_stockbit_ohlcv",
             "description": (
-                "Ambil OHLCV Stockbit Chartbit untuk symbol + timeframe. "
+                "Ambil OHLCV (tvkit) untuk symbol + timeframe. "
                 "Timeframe didukung: 5M, 30M, 1H, 1D, 1W (juga 1M/15M/4H). "
                 "Bisa multi-TF sekaligus (mis. '5M,1H,1D'). "
-                "Baca dari store lokal; set refresh=true untuk tarik ulang dari Chartbit. "
+                "Baca dari store lokal; set refresh=true untuk tarik ulang via tvkit. "
                 "INI tool utama untuk data chart Stockbit — prefer over Yahoo."
             ),
             "parameters": {
@@ -851,6 +864,33 @@ EXTRA_TOOLS: list[dict[str, Any]] = [
                 "properties": {
                     "symbol": {"type": "string"},
                     "limit": {"type": "integer"},
+                },
+                "required": ["symbol"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_stock",
+            "description": (
+                "Stock Analysis gabungan technical + fundamental untuk SATU Symbol. "
+                "Read-only (tidak scrape). Output JSON: freshness, sinyal per dimensi "
+                "(trend/momentum/volume/volatility/structure + valuation/profitability/"
+                "growth/solvency/cash_flow/dividend; bank_quality untuk bank), "
+                "conflicts[], gaps (GAP_DATA/STALE_DATA). "
+                "Tanpa buy/sell. horizon=intraday|swing|position. "
+                "Utama untuk analisis emiten; get_technicals/get_fundamentals untuk drill-down."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string"},
+                    "horizon": {
+                        "type": "string",
+                        "description": "intraday | swing (default) | position",
+                    },
                 },
                 "required": ["symbol"],
                 "additionalProperties": False,
@@ -1289,10 +1329,23 @@ def dispatch_tool(
             if not picked:
                 return "ERROR: tidak ada simbol (cek data/symbols_list.txt)"
             secs = fund_farm.normalize_sections(arguments.get("sections"))
+            force = bool(arguments.get("force", False))
+            skip_fresh_days = (
+                0 if force else max(0, int(arguments.get("skip_fresh_days") or 7))
+            )
             if len(picked) > fund_farm.BULK_THRESHOLD:
                 key = chat_id if chat_id is not None else 0
-                return fund_farm.stage_fund_job(int(key), picked, secs)
-            return fund_farm.run_fund_farm(picked, secs)
+                return fund_farm.stage_fund_job(
+                    int(key),
+                    picked,
+                    secs,
+                    skip_fresh_days=skip_fresh_days,
+                )
+            return fund_farm.run_fund_farm(
+                picked,
+                secs,
+                skip_fresh_days=skip_fresh_days,
+            )
         if name == "farm_stockbit_charts":
             from agent_idx import chart_farm
 
@@ -1340,6 +1393,13 @@ def dispatch_tool(
             return get_fundamentals(
                 arguments.get("symbol") or "",
                 limit=int(arguments.get("limit") or 40),
+            )
+        if name == "analyze_stock":
+            from agent_idx.stock_analysis import analyze_stock
+
+            return analyze_stock(
+                arguments.get("symbol") or "",
+                arguments.get("horizon") or "swing",
             )
         if name == "search_news_sentiment":
             from agent_idx.transforms import search_news_sentiment

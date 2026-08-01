@@ -32,7 +32,7 @@ _Avoid_: candle, ohlc, kline
 _Avoid_: foreign flow (use for the topic, not the number), asing, net asing
 
 **Daily panel**:
-The one-row-per-symbol-per-day table exposed as the DuckDB view `daily_stock`, backed by `data/parquet/daily_stock_summary_*.parquet`. Its `date` column is an INTEGER `YYYYMMDD`.
+The one-row-per-symbol-per-day table exposed as the DuckDB view `daily_stock`, backed by `data/parquet/daily_stock_summary_*.parquet`. Its `date` column is an INTEGER `YYYYMMDD`. With `MARKET_SOURCE=idx` the panel is **only** IDX Drive Ringkasan Saham day files (foreign flow) ∪ **tvkit** 1D bars for dates Drive does not cover (`daily_stock_summary_tvkit_gap.parquet`, foreign NULL/`GAP_DATA`). Yahoo/Stockbit rebuild parquets are ignored.
 _Avoid_: daily summary, market panel, panel (ambiguous — see **Backtest panel**)
 
 **WIB**:
@@ -56,7 +56,10 @@ _Avoid_: page, tab, sub-page
 A **Section** extractor that scrolls, clicks period/statement toggles, and runs injected JS, rather than dumping page text. Only `keystats`, `financials`, and `profile` have one.
 
 **Chartbit**:
-Stockbit's TradingView chart page, and the provenance label for all **Bars** in the project (`source = 'stockbit_chartbit'`). Chartbit carries no **Net foreign**.
+Stockbit's TradingView chart page (**Section** `chartbit`). Still used for on-demand page scrapes and URL links; it is not the chart **Farm** source. Chartbit carries no **Net foreign**.
+
+**tvkit**:
+Unofficial TradingView OHLCV client used by the chart **Farm**. Farmed **Bars** are written with `source = 'tvkit'`. Project **Timeframe** `1M` means 1 minute and maps to tvkit interval `"1"` — never pass `"1M"` through to tvkit (that is monthly there). tvkit carries no **Net foreign**.
 
 **Intercept**:
 Capturing **Bars** by listening to Stockbit's XHR JSON responses instead of reading the DOM. A 401/403 on an intercepted URL is the project's evidence that the session expired.
@@ -122,6 +125,10 @@ The markdown heading a **Metric** was found under (`current valuation`, `per sha
 **Indicator**:
 A derived technical column on a **Bar**: `sma_5/20/50/200`, `ema_12/26`, `macd*`, `rsi_14`, `vol_sma_20`. The four SMAs together are the **MA ladder**.
 _Avoid_: feature, technicals, signal
+
+**Stock Analysis**:
+The read-only combined technical + fundamental evidence pack for one **Symbol**, produced by `analyze_stock`. Horizon presets: `intraday`, `swing`, `position`. Output is JSON with freshness, per-dimension labels (`positive`/`neutral`/`negative`/`unknown`), explicit conflicts, and `GAP_DATA`/`STALE_DATA` — never a buy/sell verdict.
+_Avoid_: stock score, composite score, recommendation engine
 
 ### Agent runtime
 
@@ -209,10 +216,11 @@ The bounded win-rate filter (default 75–85%). The upper bound is deliberate: a
 
 ## Relationships
 
-- A **Farm** repeats a **Scrape** across the **Universe**; a **Cron job** or a **Staged action** invokes it.
-- Every **Scrape** goes through the one **Browser session**, which is kept logged in by the **Persistent profile**.
-- A **Scrape** writes markdown plus a **Sidecar**; the markdown becomes **Metrics** in the **Transform store**, **Bars** in the **Chart store**, or **Posts** in the **Vector store**.
+- A chart **Farm** pulls **Bars** via **tvkit** across the **Universe**; a fundamentals **Farm** repeats a **Scrape**. A **Cron job** or a **Staged action** invokes either.
+- Every Stockbit **Scrape** goes through the one **Browser session**, which is kept logged in by the **Persistent profile**. Chart farming does not use the browser.
+- A **Scrape** writes markdown plus a **Sidecar**; the markdown becomes **Metrics** in the **Transform store** or **Posts** in the **Vector store**. Chart **Bars** land in the **Chart store** from **tvkit**.
 - A question becomes a **Query plan**, which carries an **Intent**, which may bind a **Pipeline** or hit a **Forced path**; anything left over runs the **Analyst agent** tool loop.
+- **Stock Analysis** reads the **Chart store** and **Transform store** for one **Symbol**; it never triggers a **Farm** or **Scrape**.
 - `/council` bypasses that entirely: Researcher produces an **Evidence Pack**, Analyst produces a thesis, Critic returns a **Critique verdict** and possibly a **Lesson**.
 
 ## Flagged ambiguities
@@ -226,4 +234,4 @@ Unresolved collisions in the current code. Prefer the term named here; treat the
 - **"profile"** is the Chromium **Persistent profile**, the `profile` **Section**, and a Stockbit account page. Always qualify.
 - **"section"** is a **Section** in the scraper and a **Metric group** in the transform layer, sharing a column name.
 - **"farm" vs "scrape"**: charts keep the distinction, fundamentals do not (`fund_farm.scrape_one`). The distinction above is the intended one.
-- **No structured market call exists.** There is no buy/sell/hold enum, conviction score, or target-price field anywhere — every recommendation is prose under a "Pandangan" heading. Do not write code that assumes a parseable stance.
+- **No structured market call exists.** There is no buy/sell/hold enum, conviction score, or target-price field anywhere — every recommendation is prose under a "Pandangan" heading. **Stock Analysis** emits dimension labels only; do not treat them as a market call.
